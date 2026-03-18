@@ -3,7 +3,7 @@
 @import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 
 :root {
-  --panel-width: 200px;
+  --panel-width: 230px;
   --panel-gap: 0px;
   --panel-offset: calc(var(--panel-width) + var(--panel-gap));
   --ui-accent: #312E81;
@@ -71,6 +71,62 @@ body {
   }
 }
 
+.toast-feedback {
+  position: absolute;
+  top: 18px;
+  left: 50%;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 220px;
+  max-width: min(460px, calc(100vw - 32px));
+  padding: 12px 16px;
+  color: var(--ui-text);
+  background: rgba(255, 255, 255, 0.98);
+  border: 1px solid rgba(49, 46, 129, 0.12);
+  border-radius: 14px;
+  box-shadow: 0 16px 36px rgba(15, 23, 42, 0.18);
+  transform: translateX(-50%);
+  animation: toast-pop 1.8s ease forwards;
+  pointer-events: none;
+
+  i {
+    flex: 0 0 auto;
+    font-size: 18px;
+    color: #16a34a;
+  }
+
+  span {
+    font-size: 14px;
+    line-height: 1.35;
+  }
+
+  &.toast-feedback--error {
+    i {
+      color: #dc2626;
+    }
+  }
+}
+
+@keyframes toast-pop {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -10px);
+  }
+
+  12%,
+  78% {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -8px);
+  }
+}
+
 .help-overlay {
   position: absolute;
   inset: 0;
@@ -123,15 +179,53 @@ body {
 }
 
 .help-overlay__body {
+  display: grid;
+  gap: 14px;
+}
+
+.help-section {
+  padding: 12px 12px 10px;
+  background: rgba(248, 250, 252, 0.92);
+  border: 1px solid rgba(49, 46, 129, 0.08);
+  border-radius: 14px;
+}
+
+.help-section__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ui-text);
+
+  i {
+    color: var(--ui-accent);
+  }
+}
+
+.help-item {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  align-items: start;
+  gap: 10px;
+  margin-bottom: 8px;
+
+  &:last-child {
+    margin-bottom: 0;
+  }
+
+  i {
+    margin-top: 2px;
+    font-size: 13px;
+    color: var(--ui-accent);
+  }
+
   p {
-    margin: 0 0 8px;
+    margin: 0;
     font-size: 13px;
     line-height: 1.5;
     color: var(--ui-muted);
-  }
-
-  strong {
-    color: var(--ui-text);
   }
 }
 
@@ -252,5 +346,32 @@ body {
     height: 100%;
     user-select: none;
     pointer-events: none;
+  }
+
+  .image-overlay__corner-marker {
+    position: absolute;
+    width: 0;
+    height: 0;
+    pointer-events: none;
+  }
+
+  .image-overlay__corner-marker--tl {
+    top: 0;
+    left: 0;
+  }
+
+  .image-overlay__corner-marker--tr {
+    top: 0;
+    right: 0;
+  }
+
+  .image-overlay__corner-marker--br {
+    right: 0;
+    bottom: 0;
+  }
+
+  .image-overlay__corner-marker--bl {
+    bottom: 0;
+    left: 0;
   }
 }
