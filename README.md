@@ -113,11 +113,11 @@ npm run build
 
 ## Notes
 
-- the tracked `build/` output is configured for GitHub Pages under `/img2geojson/`
+- the production build uses relative asset paths so it can be hosted from a domain root or a subdirectory
 - locked image perspective is currently a visual approximation, not a full four-corner georeference warp
 - MapLibre is the safer default because it does not depend on a token
 
 ## Credits
 
 - Fork by Basel
-- Original project by [@caseymmiller](https://twitter.com/caseymmiller)
+- Original project by [@caseymmiller](https://twitter.com/caseymmiller) - [GitHub](https://github.com/caseymm/img2geojson)

@@ -5,7 +5,6 @@ import {
   Route,
 } from "react-router-dom";
 import './index.scss';
-import 'dotenv/config'
 
 import Home from './app-pages/home';
 import About from './app-pages/about';

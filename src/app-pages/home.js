@@ -39,6 +39,8 @@ const LAYER_OPACITY_PROPERTIES = {
   sky: ['sky-opacity'],
   symbol: ['icon-opacity', 'text-opacity']
 };
+const LOCKED_IMAGE_SOURCE_ID = 'img2geojson-locked-image';
+const LOCKED_IMAGE_LAYER_ID = 'img2geojson-locked-image-layer';
 
 const DRAW_STYLES = [
   {
@@ -262,15 +264,25 @@ class Map extends Component {
     this.suppressNextDrawClick = false;
   }
 
+  attachMapWheelListener = () => {
+    if (this.mapContainer.current) {
+      this.mapContainer.current.removeEventListener('wheel', this.handleMapCtrlWheel, { passive: false });
+      this.mapContainer.current.addEventListener('wheel', this.handleMapCtrlWheel, { passive: false });
+    }
+  };
+
   componentDidMount() {
     this.isMountedFlag = true;
     window.addEventListener('resize', this.handleViewportResize);
     window.addEventListener('dragover', this.handleWindowDragOver);
     window.addEventListener('drop', this.handleWindowDrop);
+    window.addEventListener('keydown', this.handleMapArrowKeys, true);
+    // Remove wheel from window, add to mapContainer with passive: false
     if (this.mapContainer.current) {
       this.mapContainer.current.addEventListener('contextmenu', this.handleContextMenu);
       this.mapContainer.current.addEventListener('mousedown', this.handleMapMouseDown);
       this.mapContainer.current.addEventListener('click', this.handleMapClickCapture, true);
+      this.mapContainer.current.addEventListener('wheel', this.handleMapCtrlWheel, { passive: false });
     }
     this.initializeMap();
   }
@@ -291,10 +303,16 @@ class Map extends Component {
     window.removeEventListener('resize', this.handleViewportResize);
     window.removeEventListener('dragover', this.handleWindowDragOver);
     window.removeEventListener('drop', this.handleWindowDrop);
+    window.removeEventListener('keydown', this.handleMapArrowKeys, true);
+    // Remove wheel from mapContainer
     if (this.mapContainer.current) {
       this.mapContainer.current.removeEventListener('contextmenu', this.handleContextMenu);
       this.mapContainer.current.removeEventListener('mousedown', this.handleMapMouseDown);
       this.mapContainer.current.removeEventListener('click', this.handleMapClickCapture, true);
+      this.mapContainer.current.removeEventListener('wheel', this.handleMapCtrlWheel, { passive: false });
+    }
+    if (this.map) {
+      this.map.off('styledata', this.attachMapWheelListener);
     }
     this.detachMiddleRotateListeners();
     this.detachLeftPanListeners();
@@ -326,27 +344,19 @@ class Map extends Component {
       };
     }
 
+    // Center in bottom half on mobile
+    const isMobile = window.innerWidth <= 600;
+    const centerY = isMobile ? containerRect.height * 0.75 : containerRect.height / 2;
+
     return {
       x: containerRect.width / 2,
-      y: containerRect.height / 2,
+      y: centerY,
       width,
       height: width / aspectRatio
     };
   };
 
   getCurrentImagePlacement = () => {
-    if (this.state.isImageLocked && this.lockedImageState && this.map) {
-      const projectedCenter = this.map.project(this.lockedImageState.anchor);
-      const scale = Math.pow(2, this.map.getZoom() - this.lockedImageState.zoom);
-
-      return {
-        x: projectedCenter.x,
-        y: projectedCenter.y,
-        width: this.lockedImageState.width * scale,
-        height: this.lockedImageState.height * scale
-      };
-    }
-
     return this.state.imagePlacement;
   };
 
@@ -361,32 +371,188 @@ class Map extends Component {
       width: `${placement.width}px`,
       height: `${placement.height}px`,
       opacity: this.state.imageOpacity,
-      transform: `translate(-50%, -50%) rotate(${this.state.imageRotation + this.getMapBearingOffset()}deg) skewX(${this.getMapSkewOffset()}deg) scaleY(${this.getMapScaleYOffset()})`
+      transform: `translate(-50%, -50%) rotate(${this.state.imageRotation}deg)`
     };
   };
 
-  getMapBearingOffset = () => {
-    if (!this.state.isImageLocked || !this.map) {
+  getTransformedImageCorners = (placement, rotationDegrees) => {
+    if (!placement) {
+      return [];
+    }
+
+    const radians = rotationDegrees * (Math.PI / 180);
+    const cosine = Math.cos(radians);
+    const sine = Math.sin(radians);
+    const halfWidth = placement.width / 2;
+    const halfHeight = placement.height / 2;
+    const baseCorners = [
+      { x: -halfWidth, y: -halfHeight },
+      { x: halfWidth, y: -halfHeight },
+      { x: halfWidth, y: halfHeight },
+      { x: -halfWidth, y: halfHeight }
+    ];
+
+    return baseCorners.map((corner) => ({
+      x: placement.x + (corner.x * cosine - corner.y * sine),
+      y: placement.y + (corner.x * sine + corner.y * cosine)
+    }));
+  };
+
+  getLockedImageScreenCorners = () => {
+    if (!this.map || !this.lockedImageState || !this.lockedImageState.coordinates) {
+      return [];
+    }
+
+    return this.lockedImageState.coordinates.map((coordinate) => {
+      const point = this.map.project(coordinate);
+      return {
+        x: point.x,
+        y: point.y
+      };
+    });
+  };
+
+  getScreenPointCenter = (points) => {
+    if (!points || points.length === 0) {
+      return null;
+    }
+
+    const aggregate = points.reduce((accumulator, point) => ({
+      x: accumulator.x + point.x,
+      y: accumulator.y + point.y
+    }), { x: 0, y: 0 });
+
+    return {
+      x: aggregate.x / points.length,
+      y: aggregate.y / points.length
+    };
+  };
+
+  getDistanceBetweenPoints = (pointA, pointB) => {
+    if (!pointA || !pointB) {
       return 0;
     }
 
-    return this.map.getBearing() * -1;
+    const deltaX = pointB.x - pointA.x;
+    const deltaY = pointB.y - pointA.y;
+    return Math.sqrt(deltaX * deltaX + deltaY * deltaY);
   };
 
-  getMapSkewOffset = () => {
-    if (!this.state.isImageLocked || !this.map) {
+  getRotationBetweenPoints = (pointA, pointB) => {
+    if (!pointA || !pointB) {
       return 0;
     }
 
-    return this.map.getPitch() * 0.18;
+    return Math.atan2(pointB.y - pointA.y, pointB.x - pointA.x) * (180 / Math.PI);
   };
 
-  getMapScaleYOffset = () => {
-    if (!this.state.isImageLocked || !this.map) {
-      return 1;
+  mapScreenPointsToCoordinates = (points) => {
+    if (!this.map) {
+      return [];
     }
 
-    return Math.max(0.72, 1 - this.map.getPitch() * 0.004);
+    return points.map((point) => {
+      const lngLat = this.map.unproject([point.x, point.y]);
+      return [lngLat.lng, lngLat.lat];
+    });
+  };
+
+  getFirstDrawLayerId = () => {
+    if (!this.map) {
+      return null;
+    }
+
+    const style = this.map.getStyle();
+    if (!style || !style.layers) {
+      return null;
+    }
+
+    const drawLayer = style.layers.find((layer) => this.isDrawLayer(layer.id));
+    return drawLayer ? drawLayer.id : null;
+  };
+
+  removeLockedImageLayer = () => {
+    if (!this.map) {
+      return;
+    }
+
+    if (this.map.getLayer(LOCKED_IMAGE_LAYER_ID)) {
+      this.map.removeLayer(LOCKED_IMAGE_LAYER_ID);
+    }
+
+    if (this.map.getSource(LOCKED_IMAGE_SOURCE_ID)) {
+      this.map.removeSource(LOCKED_IMAGE_SOURCE_ID);
+    }
+  };
+
+  syncLockedImageLayer = () => {
+    if (!this.map || !this.lockedImageState || !this.state.imageUrl) {
+      return;
+    }
+
+    const coordinates = this.lockedImageState.coordinates;
+
+    // Validate coordinates: must be 4 points, all finite numbers, and not all the same
+    if (!Array.isArray(coordinates) || coordinates.length !== 4 || coordinates.some(
+      (c) => !Array.isArray(c) || c.length !== 2 || !isFinite(c[0]) || !isFinite(c[1])
+    )) {
+    // Invalid coordinates, do not update
+      return;
+    }
+
+    if (this.map.getLayer(LOCKED_IMAGE_LAYER_ID) && this.map.getSource(LOCKED_IMAGE_SOURCE_ID)) {
+      const source = this.map.getSource(LOCKED_IMAGE_SOURCE_ID);
+
+      if (source && typeof source.setCoordinates === 'function') {
+        source.setCoordinates(coordinates);
+      }
+
+      if (
+        source &&
+        typeof source.updateImage === 'function' &&
+        this.lockedImageState.imageUrl !== this.state.imageUrl
+      ) {
+        source.updateImage({
+          url: this.state.imageUrl,
+          coordinates
+        });
+        this.lockedImageState = {
+          ...this.lockedImageState,
+          imageUrl: this.state.imageUrl
+        };
+      }
+
+      this.map.setPaintProperty(LOCKED_IMAGE_LAYER_ID, 'raster-opacity', this.state.imageOpacity);
+      return;
+    }
+
+    this.removeLockedImageLayer();
+    this.map.addSource(LOCKED_IMAGE_SOURCE_ID, {
+      type: 'image',
+      url: this.state.imageUrl,
+      coordinates
+    });
+    this.map.addLayer({
+      id: LOCKED_IMAGE_LAYER_ID,
+      type: 'raster',
+      source: LOCKED_IMAGE_SOURCE_ID,
+      paint: {
+        'raster-opacity': this.state.imageOpacity
+      }
+    }, this.getFirstDrawLayerId() || undefined);
+  };
+
+  updateLockedImageFromScreenPoints = (screenPoints, nextState) => {
+    if (!this.map || !this.lockedImageState || !screenPoints || screenPoints.length !== 4) {
+      return;
+    }
+
+    this.lockedImageState = {
+      ...this.lockedImageState,
+      coordinates: this.mapScreenPointsToCoordinates(screenPoints)
+    };
+
+    this.setState(nextState, this.syncLockedImageLayer);
   };
 
   applyMapOpacity = (opacity) => {
@@ -463,7 +629,9 @@ class Map extends Component {
       return;
     }
 
-    const emptyGroups = this.mapContainer.current.querySelectorAll('.mapboxgl-ctrl-group:empty');
+    const emptyGroups = this.mapContainer.current.querySelectorAll(
+      '.mapboxgl-ctrl-group:empty, .maplibregl-ctrl-group:empty'
+    );
     emptyGroups.forEach((node) => node.remove());
 
     const emptyCorners = this.mapContainer.current.querySelectorAll(
@@ -492,6 +660,74 @@ class Map extends Component {
     this.baseLayerOpacityCache = {};
   };
 
+  getCurrentMapView = () => {
+    if (!this.map) {
+      return {
+        lng: this.state.lng,
+        lat: this.state.lat,
+        zoom: this.state.zoom,
+        bearing: 0,
+        pitch: 0
+      };
+    }
+
+    const center = this.map.getCenter();
+
+    return {
+      lng: center.lng,
+      lat: center.lat,
+      zoom: this.map.getZoom(),
+      bearing: this.map.getBearing(),
+      pitch: this.map.getPitch()
+    };
+  };
+
+  syncViewportStateFromMap = () => {
+    if (!this.map) {
+      return;
+    }
+
+    const center = this.map.getCenter();
+
+    this.setState({
+      lng: center.lng,
+      lat: center.lat,
+      zoom: this.map.getZoom()
+    });
+  };
+
+  getDrawFeatureCollection = () => {
+    if (!this.Draw) {
+      return turf.featureCollection([]);
+    }
+
+    return this.Draw.getAll();
+  };
+
+  restoreDrawState = (featureCollection, selectedFeatureId = null) => {
+    if (
+      !this.Draw ||
+      !featureCollection ||
+      !Array.isArray(featureCollection.features)
+    ) {
+      return;
+    }
+
+    this.Draw.set(featureCollection);
+
+    const hasSelectedFeature =
+      selectedFeatureId &&
+      featureCollection.features.some((feature) => String(feature.id) === String(selectedFeatureId));
+
+    if (hasSelectedFeature) {
+      this.Draw.changeMode('simple_select', {
+        featureIds: [selectedFeatureId]
+      });
+    }
+
+    this.syncFeaturesFromDraw();
+  };
+
   initializeMap = async () => {
     const provider = resolveProvider(this.state.provider, HAS_MAPBOX_TOKEN);
 
@@ -507,6 +743,10 @@ class Map extends Component {
     if (!this.mapContainer.current) {
       return;
     }
+
+    const currentView = this.getCurrentMapView();
+    const featureSnapshot = this.getDrawFeatureCollection();
+    const selectedFeatureId = this.state.selectedFeatureId;
 
     this.cleanupMap();
     const loadId = this.activeLoadId;
@@ -524,8 +764,10 @@ class Map extends Component {
       const map = new mapLib.Map({
         container: this.mapContainer.current,
         style: getProviderStyle(provider, this.state.activeStyleVariant),
-        center: [this.state.lng, this.state.lat],
-        zoom: this.state.zoom
+        center: [currentView.lng, currentView.lat],
+        zoom: currentView.zoom,
+        bearing: currentView.bearing,
+        pitch: currentView.pitch
       });
 
       const scale = new mapLib.ScaleControl({
@@ -569,14 +811,13 @@ class Map extends Component {
       map.on('load', () => {
         this.cacheBaseLayerOpacity();
         this.applyMapOpacity(this.state.mapOpacity);
-        this.updateLockedImageTransform();
+        if (this.state.isImageLocked) {
+          this.syncLockedImageLayer();
+        }
+        this.restoreDrawState(featureSnapshot, selectedFeatureId);
         this.removeEmptyControlShells();
       });
-      map.on('move', this.handleMapInteraction);
-      map.on('zoom', this.handleMapInteraction);
-      map.on('resize', this.handleMapInteraction);
-      map.on('pitch', this.handleMapInteraction);
-      map.on('rotate', this.handleMapInteraction);
+      map.on('moveend', this.syncViewportStateFromMap);
       map.on('draw.modechange', this.handleDrawModeChange);
       map.on('draw.create', this.handleDrawCreate);
       map.on('draw.update', this.syncFeaturesFromDraw);
@@ -586,11 +827,13 @@ class Map extends Component {
       this.map = map;
       this.mapLib = mapLib;
       this.Draw = draw;
+      map.on('styledata', this.attachMapWheelListener);
 
       this.setState({
+        lng: currentView.lng,
+        lat: currentView.lat,
+        zoom: currentView.zoom,
         activeDrawMode: 'simple_select',
-        features: [],
-        selectedFeatureId: null,
         providerNotice: getMapProviderNotice(provider, HAS_MAPBOX_TOKEN),
         providerError: ''
       });
@@ -606,28 +849,8 @@ class Map extends Component {
   };
 
   updateLockedImageTransform = () => {
-    if (!this.state.isImageLocked || !this.imageOverlayRef.current) {
-      return;
-    }
-
-    const placement = this.getCurrentImagePlacement();
-
-    if (!placement) {
-      return;
-    }
-
-    const overlay = this.imageOverlayRef.current;
-    overlay.style.left = `${placement.x}px`;
-    overlay.style.top = `${placement.y}px`;
-    overlay.style.width = `${placement.width}px`;
-    overlay.style.height = `${placement.height}px`;
-    overlay.style.opacity = `${this.state.imageOpacity}`;
-    overlay.style.transform = `translate(-50%, -50%) rotate(${this.state.imageRotation + this.getMapBearingOffset()}deg) skewX(${this.getMapSkewOffset()}deg) scaleY(${this.getMapScaleYOffset()})`;
-  };
-
-  handleMapInteraction = () => {
     if (this.state.isImageLocked) {
-      this.updateLockedImageTransform();
+      this.syncLockedImageLayer();
     }
   };
 
@@ -704,7 +927,6 @@ class Map extends Component {
     }
 
     if (this.state.isImageLocked) {
-      this.updateLockedImageTransform();
       return;
     }
 
@@ -838,7 +1060,6 @@ class Map extends Component {
 
     this.map.setBearing(nextBearing);
     this.map.setPitch(nextPitch);
-    this.updateLockedImageTransform();
   };
 
   handleMiddleRotateEnd = () => {
@@ -858,7 +1079,6 @@ class Map extends Component {
       pitch: 0,
       duration: 250
     });
-    this.updateLockedImageTransform();
   };
 
   handleLeftPanMove = (event) => {
@@ -919,6 +1139,7 @@ class Map extends Component {
 
       this.revokeImageObjectUrl();
       this.imageObjectUrl = nextImageUrl;
+      this.removeLockedImageLayer();
       this.lockedImageState = null;
 
       this.setState({
@@ -951,15 +1172,21 @@ class Map extends Component {
 
     if (name === 'imageWidth') {
       if (this.state.isImageLocked && this.lockedImageState) {
-        this.lockedImageState = {
-          ...this.lockedImageState,
-          width: numericValue,
-          height: numericValue / this.state.imageAspectRatio
-        };
+        const currentScreenCorners = this.getLockedImageScreenCorners();
+        const center = this.getScreenPointCenter(currentScreenCorners);
+        const currentWidth = this.getDistanceBetweenPoints(
+          currentScreenCorners[0],
+          currentScreenCorners[1]
+        );
+        const scale = currentWidth === 0 ? 1 : numericValue / currentWidth;
+        const scaledCorners = currentScreenCorners.map((point) => ({
+          x: center.x + (point.x - center.x) * scale,
+          y: center.y + (point.y - center.y) * scale
+        }));
 
-        this.setState({
+        this.updateLockedImageFromScreenPoints(scaledCorners, {
           imageWidth: numericValue
-        }, this.updateLockedImageTransform);
+        });
 
         return;
       }
@@ -978,13 +1205,47 @@ class Map extends Component {
       return;
     }
 
+    if (name === 'mapOpacity') {
+      this.setState({
+        [name]: numericValue
+      });
+      this.applyMapOpacity(numericValue);
+      return;
+    }
+
+    if (name === 'imageOpacity') {
+      this.setState({
+        imageOpacity: numericValue
+      }, this.updateLockedImageTransform);
+      return;
+    }
+
+    if (name === 'imageRotation' && this.state.isImageLocked && this.lockedImageState) {
+      const currentScreenCorners = this.getLockedImageScreenCorners();
+      const center = this.getScreenPointCenter(currentScreenCorners);
+      const deltaRotation = numericValue - this.state.imageRotation;
+      const radians = deltaRotation * (Math.PI / 180);
+      const cosine = Math.cos(radians);
+      const sine = Math.sin(radians);
+      const rotatedCorners = currentScreenCorners.map((point) => {
+        const relativeX = point.x - center.x;
+        const relativeY = point.y - center.y;
+
+        return {
+          x: center.x + (relativeX * cosine - relativeY * sine),
+          y: center.y + (relativeX * sine + relativeY * cosine)
+        };
+      });
+
+      this.updateLockedImageFromScreenPoints(rotatedCorners, {
+        imageRotation: numericValue
+      });
+      return;
+    }
+
     this.setState({
       [name]: numericValue
     });
-
-    if (name === 'mapOpacity') {
-      this.applyMapOpacity(numericValue);
-    }
   };
 
   handleProviderChange = (provider) => {
@@ -1010,25 +1271,45 @@ class Map extends Component {
       this.getCurrentImagePlacement() ||
       this.getCenteredImagePlacement(this.state.imageWidth, this.state.imageAspectRatio);
 
+    const screenCorners = this.getTransformedImageCorners(placement, this.state.imageRotation);
+
     this.lockedImageState = {
-      anchor: this.map.unproject([placement.x, placement.y]),
-      zoom: this.map.getZoom(),
-      width: placement.width,
-      height: placement.height
+      coordinates: this.mapScreenPointsToCoordinates(screenCorners),
+      imageUrl: this.state.imageUrl
     };
 
     this.setState({
       isImageLocked: true
-    }, this.updateLockedImageTransform);
+    }, this.syncLockedImageLayer);
   };
 
   unlockImageFromMap = () => {
-    const placement = this.getCurrentImagePlacement();
+    const currentScreenCorners = this.getLockedImageScreenCorners();
+    const center = this.getScreenPointCenter(currentScreenCorners);
+    let placement;
+    if (center && currentScreenCorners.length === 4) {
+      placement = {
+        x: center.x,
+        y: center.y,
+        width: this.getDistanceBetweenPoints(currentScreenCorners[0], currentScreenCorners[1]),
+        height: this.getDistanceBetweenPoints(currentScreenCorners[0], currentScreenCorners[3])
+      };
+    } else {
+      placement = this.getCenteredImagePlacement(this.state.imageWidth, this.state.imageAspectRatio);
+    }
+    const nextRotation = this.getRotationBetweenPoints(
+      currentScreenCorners[0],
+      currentScreenCorners[1]
+    );
+
+    this.removeLockedImageLayer();
     this.lockedImageState = null;
 
     this.setState({
       isImageLocked: false,
-      imagePlacement: placement
+      imagePlacement: placement,
+      imageWidth: placement.width,
+      imageRotation: Number.isFinite(nextRotation) ? nextRotation : this.state.imageRotation
     });
   };
 
@@ -1037,11 +1318,16 @@ class Map extends Component {
       return;
     }
 
+    const featureSnapshot = this.getDrawFeatureCollection();
+    const selectedFeatureId = this.state.selectedFeatureId;
+
     this.map.setStyle(getProviderStyle(this.state.provider, variant));
-    this.map.once('styledata', () => {
+    this.map.once('style.load', () => {
       this.cacheBaseLayerOpacity();
       this.applyMapOpacity(this.state.mapOpacity);
-      this.updateLockedImageTransform();
+      this.syncLockedImageLayer();
+      this.restoreDrawState(featureSnapshot, selectedFeatureId);
+      this.removeEmptyControlShells();
     });
 
     this.setState({
@@ -1256,6 +1542,40 @@ class Map extends Component {
     }));
   };
 
+  handleMapArrowKeys = (event) => {
+    if (!this.map) return;
+    const panAmount = event.ctrlKey ? 1 : 100; // px
+    let dx = 0, dy = 0;
+    switch (event.key) {
+      case 'ArrowUp':
+        dy = -panAmount;
+        break;
+      case 'ArrowDown':
+        dy = panAmount;
+        break;
+      case 'ArrowLeft':
+        dx = -panAmount;
+        break;
+      case 'ArrowRight':
+        dx = panAmount;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    this.map.panBy([dx, dy], { animate: false });
+  };
+
+  handleMapCtrlWheel = (event) => {
+    if (!this.map) return;
+    if (event.ctrlKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      const direction = event.deltaY > 0 ? -1 : 1;
+      this.map.setZoom(this.map.getZoom() + direction * 0.01);
+    }
+  };
+
   render() {
     const providerOptions = getMapProviderOptions(HAS_MAPBOX_TOKEN);
     const isDrawing =
@@ -1282,7 +1602,7 @@ class Map extends Component {
           title={this.state.isHelpOpen ? 'Close help' : 'Open help'}
           type="button"
         >
-          i
+          <i className="fa-solid fa-circle-info" aria-hidden="true"></i>
         </button>
         {this.state.isHelpOpen && (
           <div
@@ -1337,10 +1657,10 @@ class Map extends Component {
             </div>
           </div>
         )}
-        {this.state.imageUrl && (
+        {this.state.imageUrl && !this.state.isImageLocked && (
           <div
             ref={this.imageOverlayRef}
-            className={`image-overlay${this.state.isImageLocked ? ' image-overlay--locked' : ''}`}
+            className="image-overlay"
             style={this.getOverlayStyle()}
           >
             <img src={this.state.imageUrl} alt="" draggable="false" />
@@ -1348,39 +1668,41 @@ class Map extends Component {
         )}
         <div className="panel panel--left">
           <div className="panel__tools">
-            <p>Drawing</p>
-            <p className="small">Left drag pans. Right drag freehands. Middle drag rotates and pitches.</p>
+            <p className="header">Drawing</p>
             <div className="button-container button-container--draw">
               <button
                 aria-label="Draw polygon"
-                className={`mapbox-gl-draw_polygon${
-                  this.state.activeDrawMode === 'draw_polygon' ? ' is-active' : ''
-                }`}
+                className={`mapbox-gl-draw_polygon${this.state.activeDrawMode === 'draw_polygon' ? ' is-active' : ''}`}
                 onClick={() => this.startDrawMode('draw_polygon')}
                 title="Draw polygon"
                 type="button"
-              />
+              >
+                <i className="fa-solid fa-draw-polygon" aria-hidden="true"></i>
+              </button>
               <button
                 aria-label="Draw line"
-                className={`mapbox-gl-draw_line${
-                  this.state.activeDrawMode === 'draw_line_string' ? ' is-active' : ''
-                }`}
+                className={`mapbox-gl-draw_line${this.state.activeDrawMode === 'draw_line_string' ? ' is-active' : ''}`}
                 onClick={() => this.startDrawMode('draw_line_string')}
                 title="Draw line"
                 type="button"
-              />
+              >
+                <i className="fa-solid fa-pen-ruler" aria-hidden="true"></i>
+              </button>
               <button
                 aria-label="Delete selected drawing"
                 className="mapbox-gl-draw_trash"
                 onClick={this.clearSelectedDrawing}
                 title="Delete selected drawing"
                 type="button"
-              />
+              >
+                <i className="fa-solid fa-trash" aria-hidden="true"></i>
+              </button>
             </div>
             <button className="geojson" onClick={this.downloadGeoJSON} type="button">
               Download all
             </button>
           </div>
+          <p className="header">Features</p>
           <div className="feature-list">
             {this.state.features.length === 0 && (
               <p className="small feature-list__empty">No features yet.</p>
@@ -1455,21 +1777,23 @@ class Map extends Component {
           </div>
         </div>
         <div className="panel panel--right">
-          <p>Image</p>
-          <button onClick={this.openFilePicker} type="button">
-            Select file
-          </button>
-          <p className="header">Image lock</p>
+          <div className="button-container">
+            {this.state.isImageLocked ? (
+              <button className="unlock" style={{ width: '100%' }} onClick={this.unlockImageFromMap}>
+                <i className="fa-solid fa-lock" aria-hidden="true" style={{ marginRight: 8 }}></i> Unlock from map
+              </button>
+            ) : (
+              <button className="lock" style={{ width: '100%' }} onClick={this.lockImageToMap}>
+                <i className="fa-solid fa-lock-open" aria-hidden="true" style={{ marginRight: 8 }}></i> Lock image to map
+              </button>
+            )}
+          </div>
           <p className="small">Lock ties the image to the map while you pan and zoom.</p>
-          <button
-            className={`lock-toggle ${this.state.isImageLocked ? 'unlock is-active' : 'lock'}`}
-            onClick={this.toggleImageLock}
-            type="button"
-          >
-            {this.state.isImageLocked ? 'Unlock image' : 'Lock image'}
+          <button onClick={this.openFilePicker} type="button">
+            <i className="fa-solid fa-upload" aria-hidden="true" style={{ marginRight: 8 }}></i> Upload image
           </button>
           <p className="header">Zoom</p>
-          <p className="small">Use wheel zoom, or fine tune here.</p>
+          <p className="small">Fine tune map zoom.</p>
           <div className="button-container button-container--zoom">
             <button
               aria-label="Zoom out"
@@ -1477,14 +1801,18 @@ class Map extends Component {
               onClick={this.finZoomOut}
               title="Zoom out"
               type="button"
-            />
+            >
+              <i className="fa-solid fa-magnifying-glass-minus" aria-hidden="true"></i>
+            </button>
             <button
               aria-label="Zoom in"
               className="zoom-button zoom-button--in"
               onClick={this.finZoomIn}
               title="Zoom in"
               type="button"
-            />
+            >
+              <i className="fa-solid fa-magnifying-glass-plus" aria-hidden="true"></i>
+            </button>
           </div>
           <p className="header">Opacity</p>
           <label>
@@ -1605,7 +1933,7 @@ class Map extends Component {
           </div>
           {this.state.providerError && <p className="small error">{this.state.providerError}</p>}
           <p className="small panel-credit">
-            By Basel, forked from the original by <a href="https://twitter.com/caseymmiller">@caseymmiller</a>.
+            By Basel — v2.0 of <a href="https://caseymm.github.io/img2geojson/">original</a>.
           </p>
           <a id="export" href="data:,">
             file

@@ -3,13 +3,19 @@
 @import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 
 :root {
-  --panel-width: 208px;
-  --panel-gap: 16px;
+  --panel-width: 200px;
+  --panel-gap: 0px;
   --panel-offset: calc(var(--panel-width) + var(--panel-gap));
   --ui-accent: #312E81;
   --ui-text: #1d2430;
   --ui-muted: #4b5563;
   --ui-border: rgba(49, 46, 129, 0.18);
+}
+
+@media (max-width: 600px) {
+  :root {
+    --panel-offset: 0px;
+  }
 }
 
 html,
@@ -38,8 +44,8 @@ body {
 
 .help-trigger {
   position: absolute;
-  top: 12px;
-  right: calc(var(--panel-offset) + 4px);
+  bottom: 10px;
+  left: calc(var(--panel-offset) + 4px);
   z-index: 4;
   display: inline-flex;
   align-items: center;
@@ -147,7 +153,9 @@ body {
 .maplibregl-ctrl-bottom-left,
 .mapboxgl-ctrl-top-left,
 .maplibregl-ctrl-top-left {
-  left: var(--panel-offset);
+  // left: var(--panel-offset);
+  right: calc(var(--panel-offset) + 44px);
+  left: auto;
 }
 
 .mapboxgl-ctrl-bottom-right,
@@ -163,7 +171,7 @@ body {
 .maplibregl-ctrl-scale {
   font-family: inherit;
   font-size: 12px;
-  border-radius: 10px !important;
+  // border-radius: 10px !important;
   overflow: hidden;
 }
 

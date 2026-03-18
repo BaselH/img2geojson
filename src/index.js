@@ -4,7 +4,6 @@ import 'mapbox-gl/dist/mapbox-gl.css';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import './index.scss';
 import './sidebar.scss';
-import 'dotenv/config'
 import App from './App';
  
 ReactDOM.render(
