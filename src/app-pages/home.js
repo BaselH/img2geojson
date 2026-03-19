@@ -21,11 +21,11 @@ const REGION_PRESETS = {
     lat: -25.7,
     zoom: 3.6
   },
-  jordan: {
-    label: 'Jordan',
-    lng: 36.35,
-    lat: 31.25,
-    zoom: 7
+  middleEast: {
+    label: 'Middle East',
+    lng: 41,
+    lat: 29,
+    zoom: 4.2
   }
 };
 const LAYER_OPACITY_PROPERTIES = {
@@ -56,6 +56,15 @@ const RANGE_FIELD_CONFIG = {
   imagePerspectiveX: { min: -400, max: 400, step: 1, decimals: 0, suffix: 'px' },
   imagePerspectiveY: { min: -400, max: 400, step: 1, decimals: 0, suffix: 'px' },
   imagePerspectiveZ: { min: -400, max: 400, step: 1, decimals: 0, suffix: 'px' }
+};
+const DEFAULT_RANGE_VALUES = {
+  mapOpacity: 1,
+  imageOpacity: 0.5,
+  imageWidth: 800,
+  imageRotation: 0,
+  imagePerspectiveX: 0,
+  imagePerspectiveY: 0,
+  imagePerspectiveZ: 0
 };
 
 const DRAW_STYLES = [
@@ -250,8 +259,9 @@ class Map extends Component {
       mapOpacity: 1,
       imageOpacity: 0.5,
       imageWidth: 800,
-      imageHeight: 600,
+      imageHeight: 800,
       isAspectRatioLocked: true,
+      aspectLockRatio: 800 / 800,
       imageRotation: 0,
       imagePerspectiveX: 0,
       imagePerspectiveY: 0,
@@ -274,7 +284,13 @@ class Map extends Component {
       provider,
       providerNotice: getMapProviderNotice(provider, HAS_MAPBOX_TOKEN),
       providerError: '',
-      isHelpOpen: false
+      isHelpOpen: false,
+      canUndo: false,
+      canRedo: false,
+      toolsSectionOpen: true,
+      featuresSectionOpen: true,
+      imageSectionOpen: true,
+      mapSectionOpen: true
     };
 
     this.mapContainer = React.createRef();
@@ -290,6 +306,10 @@ class Map extends Component {
     this.leftPanState = null;
     this.suppressNextDrawClick = false;
     this.feedbackTimeout = null;
+    this.historyStack = [];
+    this.historyIndex = -1;
+    this.isApplyingHistory = false;
+    this.rangeInteraction = null;
   }
 
   attachMapWheelListener = () => {
@@ -306,7 +326,7 @@ class Map extends Component {
     window.addEventListener('drop', this.handleWindowDrop);
     window.addEventListener('copy', this.handleWindowCopy, true);
     window.addEventListener('paste', this.handleWindowPaste, true);
-    window.addEventListener('keydown', this.handleMapArrowKeys, true);
+    window.addEventListener('keydown', this.handleGlobalKeyDown, true);
     // Remove wheel from window, add to mapContainer with passive: false
     if (this.mapContainer.current) {
       this.mapContainer.current.addEventListener('contextmenu', this.handleContextMenu);
@@ -335,7 +355,8 @@ class Map extends Component {
     window.removeEventListener('drop', this.handleWindowDrop);
     window.removeEventListener('copy', this.handleWindowCopy, true);
     window.removeEventListener('paste', this.handleWindowPaste, true);
-    window.removeEventListener('keydown', this.handleMapArrowKeys, true);
+    window.removeEventListener('keydown', this.handleGlobalKeyDown, true);
+    this.detachRangeInteractionListeners();
     // Remove wheel from mapContainer
     if (this.mapContainer.current) {
       this.mapContainer.current.removeEventListener('contextmenu', this.handleContextMenu);
@@ -473,19 +494,58 @@ class Map extends Component {
     return (points || []).map((point) => ({ x: point.x, y: point.y }));
   };
 
+  areValidScreenCorners = (corners) => {
+    return Array.isArray(corners) &&
+      corners.length === 4 &&
+      corners.every((corner) => (
+        corner &&
+        Number.isFinite(corner.x) &&
+        Number.isFinite(corner.y)
+      ));
+  };
+
+  getScreenCornerBounds = (corners) => {
+    if (!this.areValidScreenCorners(corners)) {
+      return null;
+    }
+
+    return corners.reduce((bounds, corner) => ({
+      minX: Math.min(bounds.minX, corner.x),
+      minY: Math.min(bounds.minY, corner.y),
+      maxX: Math.max(bounds.maxX, corner.x),
+      maxY: Math.max(bounds.maxY, corner.y)
+    }), {
+      minX: corners[0].x,
+      minY: corners[0].y,
+      maxX: corners[0].x,
+      maxY: corners[0].y
+    });
+  };
+
+  getPlacementFromScreenCorners = (corners) => {
+    const center = this.getScreenPointCenter(corners);
+
+    return {
+      x: center ? center.x : this.getCurrentImagePlacement().x,
+      y: center ? center.y : this.getCurrentImagePlacement().y,
+      width: this.state.imageWidth,
+      height: this.state.imageHeight
+    };
+  };
+
   getCurrentImageScreenCorners = () => {
     if (this.state.isImageLocked) {
       return this.getLockedImageScreenCorners();
     }
 
-    const renderedCorners = this.getRenderedOverlayCorners();
-
-    if (renderedCorners && renderedCorners.length === 4) {
-      return renderedCorners;
+    if (this.areValidScreenCorners(this.state.imageQuad)) {
+      return this.cloneScreenPoints(this.state.imageQuad);
     }
 
-    if (this.state.imageQuad && this.state.imageQuad.length === 4) {
-      return this.cloneScreenPoints(this.state.imageQuad);
+    const renderedCorners = this.getRenderedOverlayCorners();
+
+    if (this.areValidScreenCorners(renderedCorners)) {
+      return renderedCorners;
     }
 
     return this.buildImageQuad();
@@ -644,12 +704,24 @@ class Map extends Component {
   };
 
   getOverlayStyle = () => {
-    const corners = this.getCurrentImageScreenCorners();
-    const transform = this.getProjectiveTransform(corners);
+    const corners = this.state.imageQuad && this.state.imageQuad.length === 4
+      ? this.cloneScreenPoints(this.state.imageQuad)
+      : this.buildImageQuad();
+    const bounds = this.getScreenCornerBounds(corners);
+    const origin = bounds
+      ? { x: bounds.minX, y: bounds.minY }
+      : { x: 0, y: 0 };
+    const normalizedCorners = this.areValidScreenCorners(corners)
+      ? corners.map((corner) => ({
+        x: corner.x - origin.x,
+        y: corner.y - origin.y
+      }))
+      : corners;
+    const transform = this.getProjectiveTransform(normalizedCorners);
 
     return {
-      left: '0px',
-      top: '0px',
+      left: `${origin.x}px`,
+      top: `${origin.y}px`,
       width: `${this.state.imageWidth}px`,
       height: `${this.state.imageHeight}px`,
       opacity: this.state.imageOpacity,
@@ -815,7 +887,7 @@ class Map extends Component {
     }, this.getFirstDrawLayerId() || undefined);
   };
 
-  updateLockedImageFromScreenPoints = (screenPoints, nextState) => {
+  updateLockedImageFromScreenPoints = (screenPoints, nextState, options = {}) => {
     if (!this.map || !this.lockedImageState || !screenPoints || screenPoints.length !== 4) {
       return;
     }
@@ -831,7 +903,12 @@ class Map extends Component {
       coordinates
     };
 
-    this.setState(nextState, this.syncLockedImageLayer);
+    this.setState(nextState, () => {
+      this.syncLockedImageLayer();
+      if (options.captureHistory) {
+        this.recordHistorySnapshot();
+      }
+    });
   };
 
   applyMapOpacity = (opacity) => {
@@ -1099,8 +1176,8 @@ class Map extends Component {
       map.on('moveend', this.syncViewportStateFromMap);
       map.on('draw.modechange', this.handleDrawModeChange);
       map.on('draw.create', this.handleDrawCreate);
-      map.on('draw.update', this.syncFeaturesFromDraw);
-      map.on('draw.delete', this.syncFeaturesFromDraw);
+      map.on('draw.update', this.handleDrawUpdate);
+      map.on('draw.delete', this.handleDrawDelete);
       map.on('draw.selectionchange', this.handleDrawSelectionChange);
 
       this.map = map;
@@ -1116,6 +1193,10 @@ class Map extends Component {
         providerNotice: getMapProviderNotice(provider, HAS_MAPBOX_TOKEN),
         providerError: ''
       });
+
+      if (this.historyStack.length === 0) {
+        map.once('load', this.resetHistory);
+      }
     } catch (error) {
       if (!this.isMountedFlag || loadId !== this.activeLoadId) {
         return;
@@ -1160,19 +1241,62 @@ class Map extends Component {
           editingFeatureId: null,
           editingFeatureLabel: ''
         },
-        this.syncFeaturesFromDraw
+        () => {
+          this.syncFeaturesFromDraw();
+          this.recordHistorySnapshot();
+        }
       );
     } else {
       this.syncFeaturesFromDraw();
+      this.recordHistorySnapshot();
     }
+  };
+
+  handleDrawUpdate = () => {
+    this.syncFeaturesFromDraw();
+    this.recordHistorySnapshot();
+  };
+
+  handleDrawDelete = () => {
+    this.syncFeaturesFromDraw();
+    this.recordHistorySnapshot();
   };
 
   handleDrawSelectionChange = (event) => {
     const selectedFeature =
       event && event.features && event.features.length > 0 ? event.features[0] : null;
+    const nextSelectedFeatureId = selectedFeature && selectedFeature.id ? String(selectedFeature.id) : null;
+
+    if (nextSelectedFeatureId === this.state.selectedFeatureId) {
+      return;
+    }
 
     this.setState({
-      selectedFeatureId: selectedFeature && selectedFeature.id ? String(selectedFeature.id) : null
+      selectedFeatureId: nextSelectedFeatureId
+    });
+  };
+
+  getDrawFeatureById = (featureId) => {
+    if (!this.Draw || !featureId) {
+      return null;
+    }
+
+    const collection = this.Draw.getAll();
+    return (collection.features || []).find((feature) => String(feature.id) === String(featureId)) || null;
+  };
+
+  areFeatureEntriesEqual = (currentFeatures, nextFeatures) => {
+    if (currentFeatures.length !== nextFeatures.length) {
+      return false;
+    }
+
+    return nextFeatures.every((feature, index) => {
+      const currentFeature = currentFeatures[index];
+
+      return currentFeature &&
+        currentFeature.id === feature.id &&
+        currentFeature.geometryType === feature.geometryType &&
+        currentFeature.label === feature.label;
     });
   };
 
@@ -1192,8 +1316,7 @@ class Map extends Component {
       return {
         id: String(feature.id),
         geometryType,
-        label,
-        feature
+        label
       };
     });
 
@@ -1202,22 +1325,90 @@ class Map extends Component {
         ? this.Draw.getSelectedIds().map((id) => String(id))
         : [];
 
+    const nextSelectedFeatureId = selectedIds[0] || null;
+
+    if (
+      this.areFeatureEntriesEqual(this.state.features, features) &&
+      this.state.selectedFeatureId === nextSelectedFeatureId
+    ) {
+      return;
+    }
+
     this.setState({
       features,
-      selectedFeatureId: selectedIds[0] || null
+      selectedFeatureId: nextSelectedFeatureId
     });
   };
 
-  setUnlockedImageQuad = (screenCorners, nextState = {}) => {
+  setUnlockedImageQuad = (screenCorners, nextState = {}, options = {}) => {
     this.setState({
       ...nextState,
       imageQuad: this.cloneScreenPoints(screenCorners),
       isImageLocked: false
+    }, () => {
+      if (options.captureHistory) {
+        this.recordHistorySnapshot();
+      }
     });
   };
 
-  updateImageScreenCorners = (transformer, nextState = {}) => {
-    const currentCorners = this.getCurrentImageScreenCorners();
+  getEditableImageScreenCorners = () => {
+    if (this.state.isImageLocked) {
+      return this.getCurrentImageScreenCorners();
+    }
+
+    if (this.state.imageQuad && this.state.imageQuad.length === 4) {
+      return this.cloneScreenPoints(this.state.imageQuad);
+    }
+
+    return this.buildImageQuad();
+  };
+
+  rebuildImageQuadFromControls = (overrides = {}) => {
+    const currentCorners = this.getEditableImageScreenCorners();
+    const center = this.getScreenPointCenter(currentCorners);
+    const width = overrides.imageWidth !== undefined ? overrides.imageWidth : this.state.imageWidth;
+    const height = overrides.imageHeight !== undefined ? overrides.imageHeight : this.state.imageHeight;
+    const rotation = overrides.imageRotation !== undefined ? overrides.imageRotation : this.state.imageRotation;
+    const perspectiveX = overrides.imagePerspectiveX !== undefined ? overrides.imagePerspectiveX : this.state.imagePerspectiveX;
+    const perspectiveY = overrides.imagePerspectiveY !== undefined ? overrides.imagePerspectiveY : this.state.imagePerspectiveY;
+    const perspectiveZ = overrides.imagePerspectiveZ !== undefined ? overrides.imagePerspectiveZ : this.state.imagePerspectiveZ;
+    const fallbackPlacement = this.getCurrentImagePlacement(width, height);
+    const placement = {
+      x: center ? center.x : fallbackPlacement.x,
+      y: center ? center.y : fallbackPlacement.y,
+      width,
+      height
+    };
+
+    return this.buildImageQuad(
+      placement,
+      rotation,
+      perspectiveX,
+      perspectiveY,
+      perspectiveZ,
+      width,
+      height
+    );
+  };
+
+  applyRebuiltImageQuad = (nextState, options = {}) => {
+    const nextCorners = this.rebuildImageQuadFromControls(nextState);
+
+    if (!nextCorners || nextCorners.length !== 4) {
+      return;
+    }
+
+    if (this.state.isImageLocked) {
+      this.updateLockedImageFromScreenPoints(nextCorners, nextState, options);
+      return;
+    }
+
+    this.setUnlockedImageQuad(nextCorners, nextState, options);
+  };
+
+  updateImageScreenCorners = (transformer, nextState = {}, options = {}) => {
+    const currentCorners = this.getEditableImageScreenCorners();
 
     if (!currentCorners || currentCorners.length !== 4) {
       return;
@@ -1230,11 +1421,11 @@ class Map extends Component {
     }
 
     if (this.state.isImageLocked) {
-      this.updateLockedImageFromScreenPoints(nextCorners, nextState);
+      this.updateLockedImageFromScreenPoints(nextCorners, nextState, options);
       return;
     }
 
-    this.setUnlockedImageQuad(nextCorners, nextState);
+    this.setUnlockedImageQuad(nextCorners, nextState, options);
   };
 
   scaleImageQuad = (corners, scaleX = 1, scaleY = 1) => {
@@ -1373,6 +1564,18 @@ class Map extends Component {
     return /\.(geojson|json)$/i.test(file.name || '');
   };
 
+  getClipboardImageFile = (clipboardData) => {
+    if (!clipboardData || !clipboardData.items) {
+      return null;
+    }
+
+    const imageItem = Array.from(clipboardData.items).find((item) => {
+      return item.kind === 'file' && item.type.indexOf('image/') === 0;
+    });
+
+    return imageItem ? imageItem.getAsFile() : null;
+  };
+
   readFileAsText = (file) => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -1403,6 +1606,218 @@ class Map extends Component {
     }, 1800);
   };
 
+  cloneHistoryValue = (value) => {
+    return value === null || value === undefined
+      ? value
+      : JSON.parse(JSON.stringify(value));
+  };
+
+  getHistorySnapshot = () => {
+    return {
+      drawData: this.cloneHistoryValue(this.Draw ? this.getNormalizedDrawData() : turf.featureCollection([])),
+      selectedFeatureId: this.state.selectedFeatureId,
+      activeDrawMode: this.state.activeDrawMode,
+      image: {
+        imageUrl: this.state.imageUrl,
+        imageAspectRatio: this.state.imageAspectRatio,
+        imagePlacement: this.cloneHistoryValue(this.state.imagePlacement),
+        imageQuad: this.cloneHistoryValue(this.state.imageQuad),
+        isImageLocked: this.state.isImageLocked,
+        imageOpacity: this.state.imageOpacity,
+        imageWidth: this.state.imageWidth,
+        imageHeight: this.state.imageHeight,
+        isAspectRatioLocked: this.state.isAspectRatioLocked,
+        aspectLockRatio: this.state.aspectLockRatio,
+        imageRotation: this.state.imageRotation,
+        imagePerspectiveX: this.state.imagePerspectiveX,
+        imagePerspectiveY: this.state.imagePerspectiveY,
+        imagePerspectiveZ: this.state.imagePerspectiveZ
+      },
+      lockedImageState: this.cloneHistoryValue(this.lockedImageState)
+    };
+  };
+
+  updateHistoryAvailability = () => {
+    const canUndo = this.historyIndex > 0;
+    const canRedo = this.historyIndex >= 0 && this.historyIndex < this.historyStack.length - 1;
+
+    if (this.state.canUndo === canUndo && this.state.canRedo === canRedo) {
+      return;
+    }
+
+    this.setState({
+      canUndo,
+      canRedo
+    });
+  };
+
+  recordHistorySnapshot = () => {
+    if (this.isApplyingHistory || !this.Draw) {
+      return;
+    }
+
+    const snapshot = this.getHistorySnapshot();
+    const signature = JSON.stringify(snapshot);
+    const currentEntry = this.historyStack[this.historyIndex];
+
+    if (currentEntry && currentEntry.signature === signature) {
+      return;
+    }
+
+    const nextHistory = this.historyStack.slice(0, this.historyIndex + 1);
+    nextHistory.push({
+      signature,
+      snapshot
+    });
+
+    this.historyStack = nextHistory;
+    this.historyIndex = nextHistory.length - 1;
+    this.updateHistoryAvailability();
+  };
+
+  resetHistory = () => {
+    if (!this.Draw) {
+      return;
+    }
+
+    const snapshot = this.getHistorySnapshot();
+    this.historyStack = [{
+      signature: JSON.stringify(snapshot),
+      snapshot
+    }];
+    this.historyIndex = 0;
+    this.updateHistoryAvailability();
+  };
+
+  applyHistorySnapshot = (snapshot) => {
+    if (!snapshot || !this.Draw) {
+      return;
+    }
+
+    this.isApplyingHistory = true;
+    this.lockedImageState = this.cloneHistoryValue(snapshot.lockedImageState);
+
+    const nextImageState = snapshot.image || {};
+
+    this.setState({
+      ...nextImageState,
+      selectedFeatureId: snapshot.selectedFeatureId || null,
+      activeDrawMode: snapshot.activeDrawMode || 'simple_select',
+      editingFeatureId: null,
+      editingFeatureLabel: ''
+    }, () => {
+      if (this.lockedImageState && nextImageState.isImageLocked) {
+        this.syncLockedImageLayer();
+      } else {
+        this.removeLockedImageLayer();
+      }
+
+      this.Draw.set(this.cloneHistoryValue(snapshot.drawData) || turf.featureCollection([]));
+
+      if (snapshot.selectedFeatureId) {
+        if (snapshot.activeDrawMode === 'direct_select') {
+          this.Draw.changeMode('direct_select', {
+            featureId: snapshot.selectedFeatureId
+          });
+        } else {
+          this.Draw.changeMode('simple_select', {
+            featureIds: [snapshot.selectedFeatureId]
+          });
+        }
+      } else {
+        this.Draw.changeMode('simple_select');
+      }
+
+      this.syncFeaturesFromDraw();
+      this.isApplyingHistory = false;
+      this.updateHistoryAvailability();
+    });
+  };
+
+  undoHistory = () => {
+    if (this.historyIndex <= 0) {
+      return;
+    }
+
+    this.historyIndex -= 1;
+    this.applyHistorySnapshot(this.historyStack[this.historyIndex].snapshot);
+  };
+
+  redoHistory = () => {
+    if (this.historyIndex >= this.historyStack.length - 1) {
+      return;
+    }
+
+    this.historyIndex += 1;
+    this.applyHistorySnapshot(this.historyStack[this.historyIndex].snapshot);
+  };
+
+  attachRangeInteractionListeners = () => {
+    window.addEventListener('mouseup', this.finishRangeInteraction, true);
+    window.addEventListener('touchend', this.finishRangeInteraction, true);
+    window.addEventListener('touchcancel', this.finishRangeInteraction, true);
+  };
+
+  detachRangeInteractionListeners = () => {
+    window.removeEventListener('mouseup', this.finishRangeInteraction, true);
+    window.removeEventListener('touchend', this.finishRangeInteraction, true);
+    window.removeEventListener('touchcancel', this.finishRangeInteraction, true);
+  };
+
+  startRangeInteraction = (fieldName) => {
+    if (this.rangeInteraction && this.rangeInteraction.fieldName === fieldName) {
+      return;
+    }
+
+    if (this.rangeInteraction) {
+      this.finishRangeInteraction();
+    }
+
+    this.rangeInteraction = {
+      fieldName,
+      startValue: this.state[fieldName],
+      changed: false
+    };
+    this.attachRangeInteractionListeners();
+  };
+
+  finishRangeInteraction = () => {
+    if (!this.rangeInteraction) {
+      return;
+    }
+
+    const { changed, fieldName, startValue } = this.rangeInteraction;
+    this.rangeInteraction = null;
+    this.detachRangeInteractionListeners();
+
+    if (!changed) {
+      return;
+    }
+
+    if (Number(this.state[fieldName]) === Number(startValue)) {
+      return;
+    }
+
+    this.recordHistorySnapshot();
+  };
+
+  isRangeInteractionActive = (fieldName) => {
+    return Boolean(
+      this.rangeInteraction &&
+      this.rangeInteraction.fieldName === fieldName
+    );
+  };
+
+  getRangeInputHandlers = (fieldName) => {
+    return {
+      onMouseDown: () => this.startRangeInteraction(fieldName),
+      onTouchStart: () => this.startRangeInteraction(fieldName),
+      onMouseUp: this.finishRangeInteraction,
+      onTouchEnd: this.finishRangeInteraction,
+      onBlur: this.finishRangeInteraction
+    };
+  };
+
   isEditableTarget = (target) => {
     if (!target || typeof target.closest !== 'function') {
       return false;
@@ -1415,10 +1830,11 @@ class Map extends Component {
     const selectedFeature = this.state.selectedFeatureId
       ? this.state.features.find((feature) => feature.id === this.state.selectedFeatureId)
       : null;
+    const selectedDrawFeature = selectedFeature ? this.getDrawFeatureById(selectedFeature.id) : null;
 
-    if (selectedFeature) {
+    if (selectedFeature && selectedDrawFeature) {
       return {
-        data: this.getNormalizedDrawData(turf.featureCollection([selectedFeature.feature])),
+        data: this.getNormalizedDrawData(turf.featureCollection([selectedDrawFeature])),
         message: `Copied ${selectedFeature.label} as GeoJSON`
       };
     }
@@ -1510,6 +1926,7 @@ class Map extends Component {
       features: normalizedFeatures
     });
     this.syncFeaturesFromDraw();
+    this.recordHistorySnapshot();
     this.showActionFeedback(`Imported ${normalizedFeatures.length} feature${normalizedFeatures.length === 1 ? '' : 's'}`);
 
     try {
@@ -1601,6 +2018,18 @@ class Map extends Component {
     const clipboardData = event.clipboardData;
 
     if (!clipboardData) {
+      return;
+    }
+
+    const imageFile = this.getClipboardImageFile(clipboardData);
+
+    if (imageFile) {
+      if (!this.confirmImageOverwrite()) {
+        return;
+      }
+
+      event.preventDefault();
+      this.handleImageSelected(imageFile);
       return;
     }
 
@@ -1807,6 +2236,7 @@ class Map extends Component {
       this.setState({
         imageUrl: nextImageUrl,
         imageAspectRatio: nextAspectRatio,
+        aspectLockRatio: nextAspectRatio,
         imageHeight: nextHeight,
         imagePerspectiveX: 0,
         imagePerspectiveY: 0,
@@ -1827,7 +2257,7 @@ class Map extends Component {
         ),
         imageRotation: 0,
         isImageLocked: false
-      });
+      }, this.resetHistory);
       this.showActionFeedback('Image loaded');
     };
 
@@ -1852,12 +2282,29 @@ class Map extends Component {
         ? Number(value)
         : value;
 
+    if (typeof numericValue === 'number') {
+      this.applyRangeValue(name, numericValue);
+      return;
+    }
+
+    this.setState({
+      [name]: numericValue
+    });
+  };
+
+  applyRangeValue = (name, numericValue) => {
+    const captureHistory = !this.isRangeInteractionActive(name);
+
+    if (this.rangeInteraction && this.rangeInteraction.fieldName === name) {
+      this.rangeInteraction.changed = true;
+    }
+
     if (name === 'imageWidth') {
       const scale = this.state.imageWidth === 0 ? 1 : numericValue / this.state.imageWidth;
       const nextState = { imageWidth: numericValue };
 
       if (this.state.isAspectRatioLocked) {
-        nextState.imageHeight = numericValue / this.state.imageAspectRatio;
+        nextState.imageHeight = numericValue / this.state.aspectLockRatio;
       }
 
       this.updateImageScreenCorners(
@@ -1866,7 +2313,8 @@ class Map extends Component {
           scale,
           this.state.isAspectRatioLocked ? scale : 1
         ),
-        nextState
+        nextState,
+        { captureHistory }
       );
       return;
     }
@@ -1876,7 +2324,7 @@ class Map extends Component {
       const nextState = { imageHeight: numericValue };
 
       if (this.state.isAspectRatioLocked) {
-        nextState.imageWidth = numericValue * this.state.imageAspectRatio;
+        nextState.imageWidth = numericValue * this.state.aspectLockRatio;
       }
 
       this.updateImageScreenCorners(
@@ -1885,7 +2333,8 @@ class Map extends Component {
           this.state.isAspectRatioLocked ? scale : 1,
           scale
         ),
-        nextState
+        nextState,
+        { captureHistory }
       );
       return;
     }
@@ -1893,57 +2342,87 @@ class Map extends Component {
     if (name === 'mapOpacity') {
       this.setState({
         [name]: numericValue
+      }, () => {
+        this.applyMapOpacity(numericValue);
+        if (captureHistory) {
+          this.recordHistorySnapshot();
+        }
       });
-      this.applyMapOpacity(numericValue);
       return;
     }
 
     if (name === 'imageOpacity') {
       this.setState({
         imageOpacity: numericValue
-      }, this.updateLockedImageTransform);
+      }, () => {
+        this.updateLockedImageTransform();
+        if (captureHistory) {
+          this.recordHistorySnapshot();
+        }
+      });
       return;
     }
 
     if (name === 'imageRotation') {
-      const deltaRotation = numericValue - this.state.imageRotation;
-      this.updateImageScreenCorners(
-        (corners) => this.rotateImageQuad(corners, deltaRotation),
-        { imageRotation: numericValue }
-      );
+      this.applyRebuiltImageQuad({
+        imageRotation: numericValue
+      }, { captureHistory });
       return;
     }
 
     if (name === 'imagePerspectiveX') {
-      const deltaPerspective = numericValue - this.state.imagePerspectiveX;
-      this.updateImageScreenCorners(
-        (corners) => this.adjustImagePerspective(corners, deltaPerspective, 0),
-        { imagePerspectiveX: numericValue }
-      );
+      this.applyRebuiltImageQuad({
+        imagePerspectiveX: numericValue
+      }, { captureHistory });
       return;
     }
 
     if (name === 'imagePerspectiveY') {
-      const deltaPerspective = numericValue - this.state.imagePerspectiveY;
-      this.updateImageScreenCorners(
-        (corners) => this.adjustImagePerspective(corners, 0, deltaPerspective),
-        { imagePerspectiveY: numericValue }
-      );
+      this.applyRebuiltImageQuad({
+        imagePerspectiveY: numericValue
+      }, { captureHistory });
       return;
     }
 
     if (name === 'imagePerspectiveZ') {
-      const deltaPerspective = numericValue - this.state.imagePerspectiveZ;
-      this.updateImageScreenCorners(
-        (corners) => this.adjustImagePerspectiveZ(corners, deltaPerspective),
-        { imagePerspectiveZ: numericValue }
-      );
+      this.applyRebuiltImageQuad({
+        imagePerspectiveZ: numericValue
+      }, { captureHistory });
       return;
     }
 
     this.setState({
       [name]: numericValue
     });
+  };
+
+  getDefaultRangeValue = (fieldName) => {
+    if (fieldName === 'imageHeight') {
+      return DEFAULT_RANGE_VALUES.imageWidth / this.state.imageAspectRatio;
+    }
+
+    return DEFAULT_RANGE_VALUES[fieldName];
+  };
+
+  resetRangeField = (fieldName) => {
+    const defaultValue = this.getDefaultRangeValue(fieldName);
+
+    if (typeof defaultValue !== 'number' || Number.isNaN(defaultValue)) {
+      return;
+    }
+
+    this.applyRangeValue(fieldName, defaultValue);
+  };
+
+  isRangeFieldAtDefault = (fieldName) => {
+    const defaultValue = this.getDefaultRangeValue(fieldName);
+    const currentValue = Number(this.state[fieldName]);
+
+    if (!Number.isFinite(defaultValue) || !Number.isFinite(currentValue)) {
+      return true;
+    }
+
+    return Math.abs(currentValue - defaultValue) < 0.0001;
   };
 
   handleProviderChange = (provider) => {
@@ -1970,32 +2449,20 @@ class Map extends Component {
         };
       }
 
+      const nextAspectLockRatio =
+        currentState.imageHeight === 0
+          ? currentState.aspectLockRatio || currentState.imageAspectRatio
+          : currentState.imageWidth / currentState.imageHeight;
+
       return {
         isAspectRatioLocked: true,
-        imageHeight: currentState.imageWidth / currentState.imageAspectRatio
+        aspectLockRatio: nextAspectLockRatio
       };
-    }, () => {
-      if (!this.state.isAspectRatioLocked) {
-        return;
-      }
-
-      const targetHeight = this.state.imageWidth / this.state.imageAspectRatio;
-      const currentHeight = this.state.imageHeight;
-      const scale = currentHeight === 0 ? 1 : targetHeight / currentHeight;
-
-      if (Math.abs(scale - 1) < 0.0001) {
-        return;
-      }
-
-      this.updateImageScreenCorners(
-        (corners) => this.scaleImageQuad(corners, scale, scale),
-        { imageHeight: targetHeight }
-      );
     });
   };
 
   resetImageProportions = () => {
-    const currentCorners = this.getCurrentImageScreenCorners();
+    const currentCorners = this.getEditableImageScreenCorners();
     const center = this.getScreenPointCenter(currentCorners);
     const nextHeight = this.state.imageWidth / this.state.imageAspectRatio;
     const placement = {
@@ -2006,7 +2473,7 @@ class Map extends Component {
     };
     const nextCorners = this.buildImageQuad(
       placement,
-      this.state.imageRotation,
+      0,
       0,
       0,
       0,
@@ -2017,22 +2484,26 @@ class Map extends Component {
     if (this.state.isImageLocked) {
       this.updateLockedImageFromScreenPoints(nextCorners, {
         imageHeight: nextHeight,
+        imageRotation: 0,
         imagePerspectiveX: 0,
         imagePerspectiveY: 0,
         imagePerspectiveZ: 0,
+        aspectLockRatio: this.state.imageAspectRatio,
         isAspectRatioLocked: true
-      });
+      }, { captureHistory: true });
       return;
     }
 
     this.setUnlockedImageQuad(nextCorners, {
       imagePlacement: placement,
       imageHeight: nextHeight,
+      imageRotation: 0,
       imagePerspectiveX: 0,
       imagePerspectiveY: 0,
       imagePerspectiveZ: 0,
+      aspectLockRatio: this.state.imageAspectRatio,
       isAspectRatioLocked: true
-    });
+    }, { captureHistory: true });
   };
 
   lockImageToMap = () => {
@@ -2040,10 +2511,10 @@ class Map extends Component {
       return;
     }
 
-    const screenCorners = this.getCurrentImageScreenCorners();
+    const screenCorners = this.getEditableImageScreenCorners();
     const coordinates = this.mapScreenPointsToCoordinates(screenCorners);
 
-    if (!screenCorners || screenCorners.length !== 4 || coordinates.length !== 4) {
+    if (!this.areValidScreenCorners(screenCorners) || coordinates.length !== 4) {
       this.showActionFeedback('Could not lock the image from its current screen position', 'error');
       return;
     }
@@ -2055,20 +2526,30 @@ class Map extends Component {
 
     this.setState({
       isImageLocked: true
-    }, this.syncLockedImageLayer);
+    }, () => {
+      this.syncLockedImageLayer();
+      this.recordHistorySnapshot();
+    });
   };
 
   unlockImageFromMap = () => {
     const currentScreenCorners = this.getLockedImageScreenCorners();
+
+    if (!this.areValidScreenCorners(currentScreenCorners)) {
+      this.showActionFeedback('Could not unlock the image from its current map position', 'error');
+      return;
+    }
+
+    const nextPlacement = this.getPlacementFromScreenCorners(currentScreenCorners);
 
     this.removeLockedImageLayer();
     this.lockedImageState = null;
 
     this.setState({
       isImageLocked: false,
-      imagePlacement: this.getCurrentImagePlacement(),
+      imagePlacement: nextPlacement,
       imageQuad: this.cloneScreenPoints(currentScreenCorners)
-    });
+    }, this.recordHistorySnapshot);
   };
 
   setMapStyle = (variant) => {
@@ -2364,13 +2845,14 @@ class Map extends Component {
 
   downloadFeature = (featureId) => {
     const featureEntry = this.state.features.find((feature) => feature.id === featureId);
+    const drawFeature = this.getDrawFeatureById(featureId);
 
-    if (!featureEntry) {
+    if (!featureEntry || !drawFeature) {
       return;
     }
 
     this.triggerGeoJSONDownload(
-      this.getNormalizedDrawData(turf.featureCollection([featureEntry.feature])),
+      this.getNormalizedDrawData(turf.featureCollection([drawFeature])),
       `${featureEntry.label.replace(/\s+/g, '-').toLowerCase()}.geojson`
     );
   };
@@ -2404,15 +2886,16 @@ class Map extends Component {
 
   copyFeature = async (featureId) => {
     const featureEntry = this.state.features.find((feature) => feature.id === featureId);
+    const drawFeature = this.getDrawFeatureById(featureId);
 
-    if (!featureEntry) {
+    if (!featureEntry || !drawFeature) {
       return;
     }
 
     try {
       await navigator.clipboard.writeText(
         JSON.stringify(
-          this.getNormalizedDrawData(turf.featureCollection([featureEntry.feature])),
+          this.getNormalizedDrawData(turf.featureCollection([drawFeature])),
           null,
           2
         )
@@ -2438,7 +2921,42 @@ class Map extends Component {
     }));
   };
 
-  handleMapArrowKeys = (event) => {
+  toggleSidebarSection = (sectionName) => {
+    this.setState((currentState) => ({
+      [sectionName]: !currentState[sectionName]
+    }));
+  };
+
+  handleGlobalKeyDown = (event) => {
+    if (this.isEditableTarget(event.target)) {
+      return;
+    }
+
+    const isModifierPressed = event.ctrlKey || event.metaKey;
+
+    if (isModifierPressed && event.key.toLowerCase() === 'z') {
+      event.preventDefault();
+      if (event.shiftKey) {
+        this.redoHistory();
+      } else {
+        this.undoHistory();
+      }
+      return;
+    }
+
+    if (isModifierPressed && event.key.toLowerCase() === 'y') {
+      event.preventDefault();
+      this.redoHistory();
+      return;
+    }
+
+    if ((event.key === 'Delete' || event.key === 'Backspace') && this.Draw) {
+      event.preventDefault();
+      this.Draw.trash();
+      this.syncFeaturesFromDraw();
+      return;
+    }
+
     if (!this.map) return;
     const panAmount = event.ctrlKey ? 1 : 100; // px
     let dx = 0, dy = 0;
@@ -2477,38 +2995,104 @@ class Map extends Component {
       const config = RANGE_FIELD_CONFIG[fieldName];
 
       return (
-        <input
-          autoFocus
-          className="range-label__input"
-          min={config.min}
-          max={config.max}
-          onBlur={this.commitRangeFieldEdit}
-          onChange={this.handleRangeFieldEditChange}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              this.commitRangeFieldEdit();
-            }
+        <div className="range-label__controls">
+          <input
+            autoFocus
+            className="range-label__input"
+            min={config.min}
+            max={config.max}
+            onBlur={this.commitRangeFieldEdit}
+            onChange={this.handleRangeFieldEditChange}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                this.commitRangeFieldEdit();
+              }
 
-            if (event.key === 'Escape') {
-              this.cancelRangeFieldEdit();
-            }
-          }}
-          step={config.step}
-          type="number"
-          value={this.state.editingRangeValue}
-        />
+              if (event.key === 'Escape') {
+                this.cancelRangeFieldEdit();
+              }
+            }}
+            step={config.step}
+            type="number"
+            value={this.state.editingRangeValue}
+          />
+          <button
+            aria-label={`Reset ${fieldName}`}
+            className="range-label__reset"
+            disabled={this.isRangeFieldAtDefault(fieldName)}
+            onClick={() => this.resetRangeField(fieldName)}
+            title="Reset value"
+            type="button"
+          >
+            <i className="fa-solid fa-arrow-rotate-left" aria-hidden="true"></i>
+          </button>
+        </div>
       );
     }
 
     return (
-      <button
-        className="range-label__button"
-        onDoubleClick={() => this.startRangeFieldEdit(fieldName)}
-        type="button"
-      >
-        {formatter(this.state[fieldName])}
-      </button>
+      <div className="range-label__controls">
+        <button
+          className="range-label__button"
+          onDoubleClick={() => this.startRangeFieldEdit(fieldName)}
+          type="button"
+        >
+          {formatter(this.state[fieldName])}
+        </button>
+        <button
+          aria-label={`Reset ${fieldName}`}
+          className="range-label__reset"
+          disabled={this.isRangeFieldAtDefault(fieldName)}
+          onClick={() => this.resetRangeField(fieldName)}
+          title="Reset value"
+          type="button"
+        >
+          <i className="fa-solid fa-arrow-rotate-left" aria-hidden="true"></i>
+        </button>
+      </div>
     );
+  };
+
+  getRangeInputStyle = (fieldName) => {
+    const config = RANGE_FIELD_CONFIG[fieldName];
+
+    if (!config) {
+      return {};
+    }
+
+    const min = Number(config.min);
+    const max = Number(config.max);
+    const value = Number(this.state[fieldName]);
+    const baseColor = 'rgba(49, 46, 129, 0.14)';
+    const fillColor = 'rgba(49, 46, 129, 0.42)';
+    const span = max - min;
+
+    if (!Number.isFinite(min) || !Number.isFinite(max) || !Number.isFinite(value) || span <= 0) {
+      return {};
+    }
+
+    const percentage = ((value - min) / span) * 100;
+    const clampedPercentage = Math.max(0, Math.min(100, percentage));
+    const isZeroCenteredField = (
+      fieldName === 'imageRotation' ||
+      fieldName === 'imagePerspectiveX' ||
+      fieldName === 'imagePerspectiveY' ||
+      fieldName === 'imagePerspectiveZ'
+    );
+
+    let background = `linear-gradient(to right, ${fillColor} 0%, ${fillColor} ${clampedPercentage}%, ${baseColor} ${clampedPercentage}%, ${baseColor} 100%)`;
+
+    if (isZeroCenteredField && min < 0 && max > 0) {
+      const zeroPercentage = ((0 - min) / span) * 100;
+      const start = Math.min(clampedPercentage, zeroPercentage);
+      const end = Math.max(clampedPercentage, zeroPercentage);
+
+      background = `linear-gradient(to right, ${baseColor} 0%, ${baseColor} ${start}%, ${fillColor} ${start}%, ${fillColor} ${end}%, ${baseColor} ${end}%, ${baseColor} 100%)`;
+    }
+
+    return {
+      '--range-track-background': background
+    };
   };
 
   render() {
@@ -2540,6 +3124,18 @@ class Map extends Component {
         >
           <i className="fa-solid fa-circle-info" aria-hidden="true"></i>
         </button>
+        <button
+          aria-label={this.state.isImageLocked ? 'Unlock image from map' : 'Lock image to map'}
+          className={`map-state-badge${this.state.isImageLocked ? ' map-state-badge--locked' : ' map-state-badge--unlocked'}`}
+          onClick={this.toggleImageLock}
+          title={this.state.isImageLocked ? 'Unlock image from map' : 'Lock image to map'}
+          type="button"
+        >
+          <i
+            className={`fa-solid ${this.state.isImageLocked ? 'fa-lock' : 'fa-lock-open'}`}
+            aria-hidden="true"
+          ></i>
+        </button>
         {this.state.actionFeedback && (
           <div
             key={this.state.actionFeedback.id}
@@ -2570,7 +3166,13 @@ class Map extends Component {
               aria-label="How to use img2geojson"
             >
               <div className="help-overlay__header">
-                <p>How to use</p>
+                <div className="help-overlay__brand">
+                  <img src={`${process.env.PUBLIC_URL}/logo.svg`} alt="" />
+                  <div>
+                    <p>img2geojson</p>
+                    <span>How to use</span>
+                  </div>
+                </div>
                 <button
                   aria-label="Close help"
                   className="help-overlay__close"
@@ -2588,19 +3190,19 @@ class Map extends Component {
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-upload" aria-hidden="true"></i>
-                    <p>Select `Upload image / GeoJSON`, drag files onto the page, or paste GeoJSON from the clipboard.</p>
+                    <p>Start by selecting `Upload image / GeoJSON`, dragging a file onto the page, or pasting an image or GeoJSON from the clipboard.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-image" aria-hidden="true"></i>
-                    <p>Align the image with width, height, rotation, opacity, aspect lock, reset proportions, and perspective X/Y/Z.</p>
+                    <p>Use the image controls to line up your image with the map. Adjust size, rotation, opacity, and perspective until it sits where you want it, and use the small reset icons to zero a single control.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-lock" aria-hidden="true"></i>
-                    <p>Lock the image when you want it attached to the map. Pan, zoom, rotate, and pitch will then move the image with the map.</p>
+                    <p>When the image is lined up, click the lock badge at the top right of the map so it stays in place while you pan, zoom, rotate, or tilt the map.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-draw-polygon" aria-hidden="true"></i>
-                    <p>Trace polygons, lines, or markers. Export the whole collection or one selected feature as GeoJSON.</p>
+                    <p>Choose polygon, line, or marker and trace what you need. When you finish, copy or download the result as GeoJSON.</p>
                   </div>
                 </div>
 
@@ -2611,19 +3213,19 @@ class Map extends Component {
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-arrow-pointer" aria-hidden="true"></i>
-                    <p>Left drag pans the map, even while a draw tool is active. Left click adds precise points or drops a marker.</p>
+                    <p>Drag with the left mouse button to move around the map. Left click adds points, or places a marker if the marker tool is active.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>
-                    <p>Right drag freehands the active polygon or line tool. Polygon closes when you click the starting point again.</p>
+                    <p>Use right-drag to sketch a polygon or line freehand. For polygons, click the first point again to close the shape.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-arrows-rotate" aria-hidden="true"></i>
-                    <p>Middle drag rotates and pitches the map. Double middle click resets bearing and pitch.</p>
+                    <p>Use middle-drag to rotate or tilt the map, and double middle click if you want to reset it to flat north-up view.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-keyboard" aria-hidden="true"></i>
-                    <p>Arrow keys pan the map. Hold `Ctrl` for 1px nudges. `Ctrl/Cmd+C` copies GeoJSON and `Ctrl/Cmd+V` pastes GeoJSON when you are not typing in a field.</p>
+                    <p>Use the arrow keys to nudge the map. When a slider is focused, the arrow keys adjust that slider instead. `Ctrl/Cmd+Z` undoes, `Ctrl/Cmd+Shift+Z` or `Ctrl+Y` redoes, `Ctrl/Cmd+C` copies GeoJSON, and `Ctrl/Cmd+V` pastes an image or GeoJSON when your cursor is not inside a text field.</p>
                   </div>
                 </div>
 
@@ -2634,19 +3236,19 @@ class Map extends Component {
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-vector-square" aria-hidden="true"></i>
-                    <p>Click the active draw button again to leave draw mode. `Delete` removes the active sketch or selected feature.</p>
+                    <p>Select a draw tool to start drawing, and select it again when you want to leave draw mode. Use `Delete` or `Backspace` to remove selected vertices, the current sketch, or the selected feature.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-list" aria-hidden="true"></i>
-                    <p>The feature list lets you select, edit, rename, copy, download, or delete one feature at a time.</p>
+                    <p>Use the feature list to select, edit, rename, copy, download, or delete one item at a time.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-tag" aria-hidden="true"></i>
-                    <p>Feature names are written to `label`, `name`, and `title` in exported GeoJSON for better compatibility with other tools.</p>
+                    <p>Select a feature name in the list if you want to rename it before exporting.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-file-import" aria-hidden="true"></i>
-                    <p>Uploaded or pasted GeoJSON is appended to the current feature list. Re-importing the same feature creates a new copy.</p>
+                    <p>You can bring in existing GeoJSON by upload, drag-and-drop, or paste, and it will be added to your current feature list.</p>
                   </div>
                 </div>
 
@@ -2657,23 +3259,23 @@ class Map extends Component {
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-magnifying-glass" aria-hidden="true"></i>
-                    <p>Use the fine zoom buttons for tiny zoom adjustments. Double click any slider value to type an exact number.</p>
+                    <p>Use the zoom buttons for fine adjustments, and double click a slider value if you want to type an exact number.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-location-crosshairs" aria-hidden="true"></i>
-                    <p>Switch between Australia and Jordan or centre the map from a latitude, longitude pair such as `32.0844629063387, 35.913167314100065`.</p>
+                    <p>Jump to Australia or the Middle East, or paste coordinates such as `32.08446, 35.91316` to centre the map on a specific place.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-layer-group" aria-hidden="true"></i>
-                    <p>Style switches between blank, base, and satellite. Map opacity affects only the basemap, so your traced features stay visible.</p>
+                    <p>Switch styles when you need a cleaner tracing view. If the map is distracting, lower map opacity and keep tracing over your image.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-globe" aria-hidden="true"></i>
-                    <p>MapLibre is the default provider and uses OpenStreetMap raster tiles. Mapbox becomes available when `REACT_APP_MAPBOX_KEY` is set.</p>
+                    <p>Use `Map provider` if you want to switch between MapLibre and Mapbox.</p>
                   </div>
                   <div className="help-item">
                     <i className="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
-                    <p>Images can extend beyond the viewport, but extremely far off-screen lock attempts may be rejected for safety instead of guessed.</p>
+                    <p>If part of your image is off-screen while aligning it, bring it back into view before locking if the lock action is rejected.</p>
                   </div>
                 </div>
 
@@ -2705,403 +3307,488 @@ class Map extends Component {
           </div>
         )}
         <div className="panel panel--left">
-          <div className="panel__tools">
-            <p className="header">Drawing</p>
-            <div className="button-container button-container--draw">
-              <button
-                aria-label="Draw polygon"
-                className={`mapbox-gl-draw_polygon${this.state.activeDrawMode === 'draw_polygon' ? ' is-active' : ''}`}
-                onClick={() => this.startDrawMode('draw_polygon')}
-                title="Draw polygon"
-                type="button"
-              >
-                <i className="fa-solid fa-draw-polygon" aria-hidden="true"></i>
-              </button>
-              <button
-                aria-label="Draw line"
-                className={`mapbox-gl-draw_line${this.state.activeDrawMode === 'draw_line_string' ? ' is-active' : ''}`}
-                onClick={() => this.startDrawMode('draw_line_string')}
-                title="Draw line"
-                type="button"
-              >
+          <div className="settings-section">
+            <button
+              aria-expanded={this.state.toolsSectionOpen}
+              className={`section-toggle${this.state.toolsSectionOpen ? ' is-open' : ''}`}
+              onClick={() => this.toggleSidebarSection('toolsSectionOpen')}
+              type="button"
+            >
+              <span>
                 <i className="fa-solid fa-pen-ruler" aria-hidden="true"></i>
-              </button>
-              <button
-                aria-label="Draw marker"
-                className={`mapbox-gl-draw_point${this.state.activeDrawMode === 'draw_point' ? ' is-active' : ''}`}
-                onClick={() => this.startDrawMode('draw_point')}
-                title="Draw marker"
-                type="button"
-              >
-                <i className="fa-solid fa-location-dot" aria-hidden="true"></i>
-              </button>
-              <button
-                aria-label="Delete selected drawing"
-                className="mapbox-gl-draw_trash"
-                onClick={this.clearSelectedDrawing}
-                title="Delete selected drawing"
-                type="button"
-              >
-                <i className="fa-solid fa-trash" aria-hidden="true"></i>
-              </button>
-            </div>
-            <p className="small">Left click adds points or markers. Right drag freehands lines and polygons.</p>
-            <button onClick={this.openFilePicker} type="button">
-              <i className="fa-solid fa-upload" aria-hidden="true" style={{ marginRight: 8 }}></i>
-              Upload image / GeoJSON
+                Tools
+              </span>
+              <i className="fa-solid fa-chevron-down" aria-hidden="true"></i>
             </button>
-            <div className="button-container button-container--export">
-              <button onClick={this.downloadGeoJSON} type="button">
-                <i className="fa-solid fa-download" aria-hidden="true"></i>
-                <span>Download</span>
-              </button>
-              <button onClick={this.copyGeoJSON} type="button">
-                <i className="fa-solid fa-copy" aria-hidden="true"></i>
-                <span>Copy</span>
-              </button>
-            </div>
-          </div>
-          <p className="header">Features</p>
-          <div className="feature-list">
-            {this.state.features.length === 0 && (
-              <p className="small feature-list__empty">No features yet.</p>
-            )}
-            {this.state.features.map((feature) => (
-              <div
-                key={feature.id}
-                className={`feature-list__item${
-                  this.state.selectedFeatureId === feature.id ? ' is-selected' : ''
-                }`}
-              >
-                {this.state.editingFeatureId === feature.id ? (
-                  <input
-                    autoFocus
-                    className="feature-list__input"
-                    onBlur={this.commitFeatureLabel}
-                    onChange={this.handleFeatureLabelChange}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') {
-                        this.commitFeatureLabel();
-                      }
-
-                      if (event.key === 'Escape') {
-                        this.cancelFeatureLabelEdit();
-                      }
-                    }}
-                    value={this.state.editingFeatureLabel}
-                  />
-                ) : (
+            {this.state.toolsSectionOpen && (
+              <div className="settings-section__body settings-section__body--tools">
+                <div className="button-container button-container--history">
                   <button
-                    className="feature-list__label feature-list__label-button"
-                    onClick={() => this.startFeatureLabelEdit(feature.id)}
+                    aria-label="Undo"
+                    disabled={!this.state.canUndo}
+                    onClick={this.undoHistory}
+                    title="Undo"
                     type="button"
                   >
-                    {feature.label}
+                    <i className="fa-solid fa-arrow-rotate-left" aria-hidden="true"></i>
+                    <span>Undo</span>
                   </button>
-                )}
-                <div className="feature-list__actions">
                   <button
-                    aria-label={`Select ${feature.label}`}
-                    className="feature-action feature-action--select"
-                    disabled={this.state.selectedFeatureId === feature.id}
-                    onClick={() => this.selectFeature(feature.id)}
-                    title="Select"
+                    aria-label="Redo"
+                    disabled={!this.state.canRedo}
+                    onClick={this.redoHistory}
+                    title="Redo"
                     type="button"
-                  />
+                  >
+                    <i className="fa-solid fa-arrow-rotate-right" aria-hidden="true"></i>
+                    <span>Redo</span>
+                  </button>
+                </div>
+                <div className="button-container button-container--draw">
                   <button
-                    aria-label={`Edit ${feature.label}`}
-                    className="feature-action feature-action--edit"
-                    disabled={this.state.activeDrawMode === 'direct_select' && this.state.selectedFeatureId === feature.id}
-                    onClick={() => this.editFeature(feature.id)}
-                    title="Edit"
+                    aria-label="Draw polygon"
+                    className={`mapbox-gl-draw_polygon${this.state.activeDrawMode === 'draw_polygon' ? ' is-active' : ''}`}
+                    onClick={() => this.startDrawMode('draw_polygon')}
+                    title="Draw polygon"
                     type="button"
-                  />
+                  >
+                    <i className="fa-solid fa-draw-polygon" aria-hidden="true"></i>
+                  </button>
                   <button
-                    aria-label={`Copy ${feature.label}`}
-                    className="feature-action feature-action--copy"
-                    onClick={() => this.copyFeature(feature.id)}
-                    title="Copy"
+                    aria-label="Draw line"
+                    className={`mapbox-gl-draw_line${this.state.activeDrawMode === 'draw_line_string' ? ' is-active' : ''}`}
+                    onClick={() => this.startDrawMode('draw_line_string')}
+                    title="Draw line"
                     type="button"
-                  />
+                  >
+                    <i className="fa-solid fa-pen-ruler" aria-hidden="true"></i>
+                  </button>
                   <button
-                    aria-label={`Download ${feature.label}`}
-                    className="feature-action feature-action--download"
-                    onClick={() => this.downloadFeature(feature.id)}
-                    title="Download"
+                    aria-label="Draw marker"
+                    className={`mapbox-gl-draw_point${this.state.activeDrawMode === 'draw_point' ? ' is-active' : ''}`}
+                    onClick={() => this.startDrawMode('draw_point')}
+                    title="Draw marker"
                     type="button"
-                  />
+                  >
+                    <i className="fa-solid fa-location-dot" aria-hidden="true"></i>
+                  </button>
                   <button
-                    aria-label={`Delete ${feature.label}`}
-                    className="feature-action feature-action--delete"
-                    onClick={() => this.deleteFeature(feature.id)}
-                    title="Delete"
+                    aria-label="Delete selected drawing"
+                    className="mapbox-gl-draw_trash"
+                    onClick={this.clearSelectedDrawing}
+                    title="Delete selected drawing"
                     type="button"
-                  />
+                  >
+                    <i className="fa-solid fa-trash" aria-hidden="true"></i>
+                  </button>
+                </div>
+                <p className="small">Left click adds points. Right drag freehands.</p>
+                <button className="button-with-icon" onClick={this.openFilePicker} type="button">
+                  <i className="fa-solid fa-upload" aria-hidden="true"></i>
+                  <span>Upload image / GeoJSON</span>
+                </button>
+                <div className="button-container button-container--export">
+                  <button onClick={this.downloadGeoJSON} type="button">
+                    <i className="fa-solid fa-download" aria-hidden="true"></i>
+                    <span>Download</span>
+                  </button>
+                  <button onClick={this.copyGeoJSON} type="button">
+                    <i className="fa-solid fa-copy" aria-hidden="true"></i>
+                    <span>Copy</span>
+                  </button>
                 </div>
               </div>
-            ))}
+            )}
+          </div>
+          <div className="settings-section settings-section--grow">
+            <button
+              aria-expanded={this.state.featuresSectionOpen}
+              className={`section-toggle${this.state.featuresSectionOpen ? ' is-open' : ''}`}
+              onClick={() => this.toggleSidebarSection('featuresSectionOpen')}
+              type="button"
+            >
+              <span>
+                <i className="fa-solid fa-list" aria-hidden="true"></i>
+                Features
+              </span>
+              <i className="fa-solid fa-chevron-down" aria-hidden="true"></i>
+            </button>
+            {this.state.featuresSectionOpen && (
+              <div className="settings-section__body settings-section__body--scroll">
+                <div className="feature-list">
+                  {this.state.features.length === 0 && (
+                    <p className="small feature-list__empty">No features yet.</p>
+                  )}
+                  {this.state.features.map((feature) => (
+                    <div
+                      key={feature.id}
+                      className={`feature-list__item${this.state.selectedFeatureId === feature.id ? ' is-selected' : ''
+                        }`}
+                    >
+                      {this.state.editingFeatureId === feature.id ? (
+                        <input
+                          autoFocus
+                          className="feature-list__input"
+                          onBlur={this.commitFeatureLabel}
+                          onChange={this.handleFeatureLabelChange}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') {
+                              this.commitFeatureLabel();
+                            }
+
+                            if (event.key === 'Escape') {
+                              this.cancelFeatureLabelEdit();
+                            }
+                          }}
+                          value={this.state.editingFeatureLabel}
+                        />
+                      ) : (
+                        <button
+                          className="feature-list__label feature-list__label-button"
+                          onClick={() => this.startFeatureLabelEdit(feature.id)}
+                          type="button"
+                        >
+                          {feature.label}
+                        </button>
+                      )}
+                      <div className="feature-list__actions">
+                        <button
+                          aria-label={`Select ${feature.label}`}
+                          className="feature-action feature-action--select"
+                          disabled={this.state.selectedFeatureId === feature.id}
+                          onClick={() => this.selectFeature(feature.id)}
+                          title="Select"
+                          type="button"
+                        />
+                        <button
+                          aria-label={`Edit ${feature.label}`}
+                          className="feature-action feature-action--edit"
+                          disabled={this.state.activeDrawMode === 'direct_select' && this.state.selectedFeatureId === feature.id}
+                          onClick={() => this.editFeature(feature.id)}
+                          title="Edit"
+                          type="button"
+                        />
+                        <button
+                          aria-label={`Copy ${feature.label}`}
+                          className="feature-action feature-action--copy"
+                          onClick={() => this.copyFeature(feature.id)}
+                          title="Copy"
+                          type="button"
+                        />
+                        <button
+                          aria-label={`Download ${feature.label}`}
+                          className="feature-action feature-action--download"
+                          onClick={() => this.downloadFeature(feature.id)}
+                          title="Download"
+                          type="button"
+                        />
+                        <button
+                          aria-label={`Delete ${feature.label}`}
+                          className="feature-action feature-action--delete"
+                          onClick={() => this.deleteFeature(feature.id)}
+                          title="Delete"
+                          type="button"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         </div>
         <div className="panel panel--right">
-          <div className="button-container">
-            {this.state.isImageLocked ? (
-              <button className="unlock" style={{ width: '100%' }} onClick={this.unlockImageFromMap}>
-                <i className="fa-solid fa-lock" aria-hidden="true" style={{ marginRight: 8 }}></i> Unlock from map
-              </button>
-            ) : (
-              <button className="lock" style={{ width: '100%' }} onClick={this.lockImageToMap}>
-                <i className="fa-solid fa-lock-open" aria-hidden="true" style={{ marginRight: 8 }}></i> Lock image to map
-              </button>
+          <div className="settings-section">
+            <button
+              aria-expanded={this.state.imageSectionOpen}
+              className={`section-toggle${this.state.imageSectionOpen ? ' is-open' : ''}`}
+              onClick={() => this.toggleSidebarSection('imageSectionOpen')}
+              type="button"
+            >
+              <span>
+                <i className="fa-regular fa-image" aria-hidden="true"></i>
+                Image
+              </span>
+              <i className="fa-solid fa-chevron-down" aria-hidden="true"></i>
+            </button>
+            {this.state.imageSectionOpen && (
+              <div className="settings-section__body">
+                <label>
+                  <div className="slider-label">
+                    Opacity
+                    <div className="range-label">{this.renderRangeValue('imageOpacity', (value) => value.toFixed(2))}</div>
+                  </div>
+                  <input
+                    type="range"
+                    className="range"
+                    name="imageOpacity"
+                    min="0"
+                    max="1"
+                    step=".01"
+                    style={this.getRangeInputStyle('imageOpacity')}
+                    value={this.state.imageOpacity}
+                    onChange={this.handleChange}
+                    {...this.getRangeInputHandlers('imageOpacity')}
+                  />
+                </label>
+                <label>
+                  <div className="slider-label">
+                    Width
+                    <div className="range-label__controls">
+                      <button
+                        aria-label={this.state.isAspectRatioLocked ? 'Unlock width and height' : 'Link width and height'}
+                        className={`range-label__toggle${this.state.isAspectRatioLocked ? ' is-active' : ''}`}
+                        onClick={this.toggleAspectRatioLock}
+                        title={this.state.isAspectRatioLocked ? 'Unlock width and height' : 'Link width and height'}
+                        type="button"
+                      >
+                        <i className={`fa-solid ${this.state.isAspectRatioLocked ? 'fa-link' : 'fa-link-slash'}`} aria-hidden="true"></i>
+                      </button>
+                      <div className="range-label">{this.renderRangeValue('imageWidth', (value) => Math.round(value))}</div>
+                    </div>
+                  </div>
+                  <input
+                    type="range"
+                    className="range"
+                    name="imageWidth"
+                    min="100"
+                    max="2000"
+                    step="1"
+                    style={this.getRangeInputStyle('imageWidth')}
+                    value={this.state.imageWidth}
+                    onChange={this.handleChange}
+                    {...this.getRangeInputHandlers('imageWidth')}
+                  />
+                </label>
+                <label>
+                  <div className="slider-label">
+                    Height
+                    <div className="range-label">{this.renderRangeValue('imageHeight', (value) => Math.round(value))}</div>
+                  </div>
+                  <input
+                    type="range"
+                    className="range"
+                    name="imageHeight"
+                    min="100"
+                    max="2000"
+                    step="1"
+                    style={this.getRangeInputStyle('imageHeight')}
+                    value={this.state.imageHeight}
+                    onChange={this.handleChange}
+                    {...this.getRangeInputHandlers('imageHeight')}
+                  />
+                </label>
+                <label>
+                  <div className="slider-label">
+                    Rotation
+                    <div className="range-label">{this.renderRangeValue('imageRotation', (value) => `${value.toFixed(0)}deg`)}</div>
+                  </div>
+                  <input
+                    type="range"
+                    className="range"
+                    name="imageRotation"
+                    min="-180"
+                    max="180"
+                    step="1"
+                    style={this.getRangeInputStyle('imageRotation')}
+                    value={this.state.imageRotation}
+                    onChange={this.handleChange}
+                    {...this.getRangeInputHandlers('imageRotation')}
+                  />
+                </label>
+                <label>
+                  <div className="slider-label">
+                    Perspective X
+                    <div className="range-label">{this.renderRangeValue('imagePerspectiveX', (value) => `${value.toFixed(0)}px`)}</div>
+                  </div>
+                  <input
+                    type="range"
+                    className="range"
+                    name="imagePerspectiveX"
+                    min="-400"
+                    max="400"
+                    step="1"
+                    style={this.getRangeInputStyle('imagePerspectiveX')}
+                    value={this.state.imagePerspectiveX}
+                    onChange={this.handleChange}
+                    {...this.getRangeInputHandlers('imagePerspectiveX')}
+                  />
+                </label>
+                <label>
+                  <div className="slider-label">
+                    Perspective Y
+                    <div className="range-label">{this.renderRangeValue('imagePerspectiveY', (value) => `${value.toFixed(0)}px`)}</div>
+                  </div>
+                  <input
+                    type="range"
+                    className="range"
+                    name="imagePerspectiveY"
+                    min="-400"
+                    max="400"
+                    step="1"
+                    style={this.getRangeInputStyle('imagePerspectiveY')}
+                    value={this.state.imagePerspectiveY}
+                    onChange={this.handleChange}
+                    {...this.getRangeInputHandlers('imagePerspectiveY')}
+                  />
+                </label>
+                <label>
+                  <div className="slider-label">
+                    Perspective Z
+                    <div className="range-label">{this.renderRangeValue('imagePerspectiveZ', (value) => `${value.toFixed(0)}px`)}</div>
+                  </div>
+                  <input
+                    type="range"
+                    className="range"
+                    name="imagePerspectiveZ"
+                    min="-400"
+                    max="400"
+                    step="1"
+                    style={this.getRangeInputStyle('imagePerspectiveZ')}
+                    value={this.state.imagePerspectiveZ}
+                    onChange={this.handleChange}
+                    {...this.getRangeInputHandlers('imagePerspectiveZ')}
+                  />
+                </label>
+              </div>
             )}
           </div>
-          <p className="small">Lock ties the image to the map while you pan and zoom.</p>
-          <p className="header">Zoom</p>
-          <p className="small">Fine tune map zoom.</p>
-          <div className="button-container button-container--zoom">
+
+          <div className="settings-section">
             <button
-              aria-label="Zoom out"
-              className="zoom-button zoom-button--out"
-              onClick={this.finZoomOut}
-              title="Zoom out"
+              aria-expanded={this.state.mapSectionOpen}
+              className={`section-toggle${this.state.mapSectionOpen ? ' is-open' : ''}`}
+              onClick={() => this.toggleSidebarSection('mapSectionOpen')}
               type="button"
             >
-              <i className="fa-solid fa-magnifying-glass-minus" aria-hidden="true"></i>
+              <span>
+                <i className="fa-solid fa-map" aria-hidden="true"></i>
+                Map
+              </span>
+              <i className="fa-solid fa-chevron-down" aria-hidden="true"></i>
             </button>
-            <button
-              aria-label="Zoom in"
-              className="zoom-button zoom-button--in"
-              onClick={this.finZoomIn}
-              title="Zoom in"
-              type="button"
-            >
-              <i className="fa-solid fa-magnifying-glass-plus" aria-hidden="true"></i>
-            </button>
+            {this.state.mapSectionOpen && (
+              <div className="settings-section__body">
+                <label className="coordinate-search">
+                  <div className="slider-label">Coordinates</div>
+                  <div className="split-input">
+                    <input
+                      className="text-input"
+                      name="coordinateInput"
+                      onChange={this.handleCoordinateInputChange}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          this.centerMapOnCoordinates();
+                        }
+                      }}
+                      placeholder="32.08446, 35.91316"
+                      type="text"
+                      value={this.state.coordinateInput}
+                    />
+                    <button
+                      aria-label="Center on coordinates"
+                      className="split-input__button"
+                      onClick={this.centerMapOnCoordinates}
+                      title="Center on coordinates"
+                      type="button"
+                    >
+                      <i className="fa-solid fa-location-crosshairs" aria-hidden="true"></i>
+                    </button>
+                  </div>
+                </label>
+                <div className="button-container button-container--mode">
+                  {Object.entries(REGION_PRESETS).map(([regionKey, preset]) => (
+                    <button
+                      key={regionKey}
+                      className={this.state.activeRegion === regionKey ? 'is-active' : ''}
+                      onClick={() => this.changeRegion(regionKey)}
+                      type="button"
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="header">Zoom</p>
+                <div className="button-container button-container--zoom">
+                  <button
+                    aria-label="Zoom out"
+                    className="zoom-button zoom-button--out"
+                    onClick={this.finZoomOut}
+                    title="Zoom out"
+                    type="button"
+                  >
+                    <i className="fa-solid fa-magnifying-glass-minus" aria-hidden="true"></i>
+                  </button>
+                  <button
+                    aria-label="Zoom in"
+                    className="zoom-button zoom-button--in"
+                    onClick={this.finZoomIn}
+                    title="Zoom in"
+                    type="button"
+                  >
+                    <i className="fa-solid fa-magnifying-glass-plus" aria-hidden="true"></i>
+                  </button>
+                </div>
+                <label>
+                  <div className="slider-label">
+                    Opacity
+                    <div className="range-label">{this.renderRangeValue('mapOpacity', (value) => value.toFixed(2))}</div>
+                  </div>
+                  <input
+                    type="range"
+                    className="range"
+                    name="mapOpacity"
+                    min="0"
+                    max="1"
+                    step=".01"
+                    style={this.getRangeInputStyle('mapOpacity')}
+                    value={this.state.mapOpacity}
+                    onChange={this.handleChange}
+                    {...this.getRangeInputHandlers('mapOpacity')}
+                  />
+                </label>
+                <p className="header">Style</p>
+                <div className="button-container button-container--style">
+                  <button
+                    className={this.state.activeStyleVariant === 'blank' ? 'is-active' : ''}
+                    onClick={() => this.setMapStyle('blank')}
+                    type="button"
+                  >
+                    Blank
+                  </button>
+                  <button
+                    className={this.state.activeStyleVariant === 'default' ? 'is-active' : ''}
+                    onClick={() => this.setMapStyle('default')}
+                    type="button"
+                  >
+                    Base
+                  </button>
+                  <button
+                    className={this.state.activeStyleVariant === 'satellite' ? 'is-active' : ''}
+                    onClick={() => this.setMapStyle('satellite')}
+                    type="button"
+                  >
+                    Sat
+                  </button>
+                </div>
+                <p className="header">Map provider</p>
+                <div className="button-container button-container--providers">
+                  {providerOptions.map((option) => (
+                    <button
+                      key={option.value}
+                      className={this.state.provider === option.value ? 'is-active' : ''}
+                      disabled={option.disabled}
+                      onClick={() => this.handleProviderChange(option.value)}
+                      type="button"
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                {this.state.providerError && <p className="small error">{this.state.providerError}</p>}
+              </div>
+            )}
           </div>
-          <p className="header">Opacity</p>
-          <label>
-            <div className="slider-label">
-              Map
-              <div className="range-label">{this.renderRangeValue('mapOpacity', (value) => value.toFixed(2))}</div>
-            </div>
-            <input
-              type="range"
-              className="range"
-              name="mapOpacity"
-              min="0"
-              max="1"
-              step=".01"
-              value={this.state.mapOpacity}
-              onChange={this.handleChange}
-            />
-          </label>
-          <label>
-            <div className="slider-label">
-              Image
-              <div className="range-label">{this.renderRangeValue('imageOpacity', (value) => value.toFixed(2))}</div>
-            </div>
-            <input
-              type="range"
-              className="range"
-              name="imageOpacity"
-              min="0"
-              max="1"
-              step=".01"
-              value={this.state.imageOpacity}
-              onChange={this.handleChange}
-            />
-          </label>
-          <div className="header header--with-actions">
-            <p className="header">Image size</p>
-            <div className="header-actions">
-              <button
-                aria-label={this.state.isAspectRatioLocked ? 'Unlock aspect ratio' : 'Lock aspect ratio'}
-                className={`icon-button${this.state.isAspectRatioLocked ? ' is-active' : ''}`}
-                onClick={this.toggleAspectRatioLock}
-                title={this.state.isAspectRatioLocked ? 'Unlock aspect ratio' : 'Lock aspect ratio'}
-                type="button"
-              >
-                <i className={`fa-solid ${this.state.isAspectRatioLocked ? 'fa-link' : 'fa-link-slash'}`} aria-hidden="true"></i>
-              </button>
-              <button
-                aria-label="Reset image proportions"
-                className="icon-button"
-                onClick={this.resetImageProportions}
-                title="Reset image proportions"
-                type="button"
-              >
-                <i className="fa-solid fa-arrow-rotate-left" aria-hidden="true"></i>
-              </button>
-            </div>
-          </div>
-          <label>
-            <div className="slider-label">
-              Width
-              <div className="range-label">{this.renderRangeValue('imageWidth', (value) => Math.round(value))}</div>
-            </div>
-            <input
-              type="range"
-              className="range"
-              name="imageWidth"
-              min="100"
-              max="2000"
-              step="1"
-              value={this.state.imageWidth}
-              onChange={this.handleChange}
-            />
-          </label>
-          <label>
-            <div className="slider-label">
-              Height
-              <div className="range-label">{this.renderRangeValue('imageHeight', (value) => Math.round(value))}</div>
-            </div>
-            <input
-              type="range"
-              className="range"
-              name="imageHeight"
-              min="100"
-              max="2000"
-              step="1"
-              value={this.state.imageHeight}
-              onChange={this.handleChange}
-            />
-          </label>
-          <label>
-            <div className="slider-label">
-              Rotation
-              <div className="range-label">{this.renderRangeValue('imageRotation', (value) => `${value.toFixed(0)}deg`)}</div>
-            </div>
-            <input
-              type="range"
-              className="range"
-              name="imageRotation"
-              min="-180"
-              max="180"
-              step="1"
-              value={this.state.imageRotation}
-              onChange={this.handleChange}
-            />
-          </label>
-          <label>
-            <div className="slider-label">
-              Perspective X
-              <div className="range-label">{this.renderRangeValue('imagePerspectiveX', (value) => `${value.toFixed(0)}px`)}</div>
-            </div>
-            <input
-              type="range"
-              className="range"
-              name="imagePerspectiveX"
-              min="-400"
-              max="400"
-              step="1"
-              value={this.state.imagePerspectiveX}
-              onChange={this.handleChange}
-            />
-          </label>
-          <label>
-            <div className="slider-label">
-              Perspective Y
-              <div className="range-label">{this.renderRangeValue('imagePerspectiveY', (value) => `${value.toFixed(0)}px`)}</div>
-            </div>
-            <input
-              type="range"
-              className="range"
-              name="imagePerspectiveY"
-              min="-400"
-              max="400"
-              step="1"
-              value={this.state.imagePerspectiveY}
-              onChange={this.handleChange}
-            />
-          </label>
-          <label>
-            <div className="slider-label">
-              Perspective Z
-              <div className="range-label">{this.renderRangeValue('imagePerspectiveZ', (value) => `${value.toFixed(0)}px`)}</div>
-            </div>
-            <input
-              type="range"
-              className="range"
-              name="imagePerspectiveZ"
-              min="-400"
-              max="400"
-              step="1"
-              value={this.state.imagePerspectiveZ}
-              onChange={this.handleChange}
-            />
-          </label>
-          <p className="header">Style</p>
-          <div className="button-container button-container--style">
-            <button
-              className={this.state.activeStyleVariant === 'blank' ? 'is-active' : ''}
-              onClick={() => this.setMapStyle('blank')}
-              type="button"
-            >
-              Blank
-            </button>
-            <button
-              className={this.state.activeStyleVariant === 'default' ? 'is-active' : ''}
-              onClick={() => this.setMapStyle('default')}
-              type="button"
-            >
-              Base
-            </button>
-            <button
-              className={this.state.activeStyleVariant === 'satellite' ? 'is-active' : ''}
-              onClick={() => this.setMapStyle('satellite')}
-              type="button"
-            >
-              Sat
-            </button>
-          </div>
-          <p className="header">Region</p>
-          <div className="button-container button-container--mode">
-            {Object.entries(REGION_PRESETS).map(([regionKey, preset]) => (
-              <button
-                key={regionKey}
-                className={this.state.activeRegion === regionKey ? 'is-active' : ''}
-                onClick={() => this.changeRegion(regionKey)}
-                type="button"
-              >
-                {preset.label}
-              </button>
-            ))}
-          </div>
-          <label className="coordinate-search">
-            <div className="slider-label">
-              Coordinates
-            </div>
-            <input
-              className="text-input"
-              name="coordinateInput"
-              onChange={this.handleCoordinateInputChange}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  this.centerMapOnCoordinates();
-                }
-              }}
-              placeholder="32.0844629063387, 35.913167314100065"
-              type="text"
-              value={this.state.coordinateInput}
-            />
-          </label>
-          <button onClick={this.centerMapOnCoordinates} type="button">
-            Center on coordinates
-          </button>
-          <p className="header">Map provider</p>
-          <div className="button-container button-container--providers">
-            {providerOptions.map((option) => (
-              <button
-                key={option.value}
-                className={this.state.provider === option.value ? 'is-active' : ''}
-                disabled={option.disabled}
-                onClick={() => this.handleProviderChange(option.value)}
-                type="button"
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-          {this.state.providerError && <p className="small error">{this.state.providerError}</p>}
           <a id="export" href="data:,">
             file
           </a>

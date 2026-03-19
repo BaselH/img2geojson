@@ -6,7 +6,7 @@ This fork extends the original project with a split-panel tracing UI, MapLibre s
 
 ## What The App Can Do
 
-- load an image from the upload button or by dragging it onto the page
+- load an image from the upload button, by dragging it onto the page, or by normal clipboard paste
 - load GeoJSON from upload, drag and drop, or normal clipboard paste
 - align an image using width, height, rotation, opacity, aspect-ratio lock, reset proportions, and perspective X/Y/Z
 - lock the image to the map so it follows pan, zoom, rotate, and pitch
@@ -15,10 +15,10 @@ This fork extends the original project with a split-panel tracing UI, MapLibre s
 - keep a feature list with select, edit, rename, copy, download, and delete actions
 - export one feature or the full collection as GeoJSON
 - copy GeoJSON with buttons or normal `Ctrl/Cmd+C`
-- paste GeoJSON with normal `Ctrl/Cmd+V`
+- paste an image or GeoJSON with normal `Ctrl/Cmd+V`
 - switch between `MapLibre` and `Mapbox`
 - switch basemap style between `Blank`, `Base`, and `Satellite`
-- jump between Australia and Jordan presets
+- jump between Australia and Middle East presets
 - centre the map from typed coordinates
 
 ## Layout
@@ -30,7 +30,7 @@ This fork extends the original project with a split-panel tracing UI, MapLibre s
 
 ## Quick Start
 
-1. Upload an image or drag one onto the page.
+1. Upload an image, drag one onto the page, or paste one from the clipboard.
 2. Adjust width, height, rotation, opacity, and perspective until it lines up with the map.
 3. Lock the image when you want it attached to the map.
 4. Draw polygons, lines, or markers.
@@ -53,7 +53,7 @@ This fork extends the original project with a split-panel tracing UI, MapLibre s
 - Arrow keys pan the map.
 - Hold `Ctrl` with arrow keys for very small pan nudges.
 - `Ctrl/Cmd+C` copies GeoJSON when focus is not inside a text field.
-- `Ctrl/Cmd+V` pastes GeoJSON when focus is not inside a text field.
+- `Ctrl/Cmd+V` pastes an image or GeoJSON when focus is not inside a text field.
 
 ## Drawing Workflow
 
@@ -105,7 +105,7 @@ This fork extends the original project with a split-panel tracing UI, MapLibre s
 
 ### Import
 
-- image upload asks before replacing the current image
+- image upload or paste asks before replacing the current image
 - GeoJSON upload appends features to the existing collection
 - pasted GeoJSON also appends features
 - re-importing the same GeoJSON creates a new copy instead of overwriting the old one
@@ -129,11 +129,11 @@ Feature names are written to these properties for better compatibility with exte
 ### Regions
 
 - Australia preset
-- Jordan preset
+- Middle East preset
 - typed coordinates in `latitude, longitude` format, for example:
 
 ```text
-32.0844629063387, 35.913167314100065
+32.08446, 35.91316
 ```
 
 ### Styles

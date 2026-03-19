@@ -64,6 +64,30 @@ const MAPLIBRE_BLANK_STYLE = {
 const STORAGE_KEY = 'img2geojson.mapProvider';
 const DEFAULT_PROVIDER = normalizeProvider(process.env.REACT_APP_MAP_PROVIDER);
 
+function safeGetStorageItem(key) {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return null;
+  }
+
+  try {
+    return window.localStorage.getItem(key);
+  } catch (error) {
+    return null;
+  }
+}
+
+function safeSetStorageItem(key, value) {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(key, value);
+  } catch (error) {
+    // Ignore storage write failures so the app can still render.
+  }
+}
+
 function normalizeProvider(provider) {
   return provider === MAP_PROVIDERS.mapbox ? MAP_PROVIDERS.mapbox : MAP_PROVIDERS.maplibre;
 }
@@ -81,18 +105,13 @@ function unwrapModule(moduleValue) {
 }
 
 export function getInitialMapProvider(hasMapboxToken) {
-  const storedProvider =
-    typeof window !== 'undefined' ? window.localStorage.getItem(STORAGE_KEY) : null;
+  const storedProvider = safeGetStorageItem(STORAGE_KEY);
 
   return resolveProvider(storedProvider || DEFAULT_PROVIDER, hasMapboxToken);
 }
 
 export function persistMapProvider(provider) {
-  if (typeof window === 'undefined') {
-    return;
-  }
-
-  window.localStorage.setItem(STORAGE_KEY, provider);
+  safeSetStorageItem(STORAGE_KEY, provider);
 }
 
 export function resolveProvider(provider, hasMapboxToken) {
